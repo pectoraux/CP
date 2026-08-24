@@ -24,6 +24,10 @@ import {
 } from "@cp/organizations";
 import { ProjectsService, migrateProjectsSchema } from "@cp/projects";
 import {
+  CapabilitiesService,
+  migrateCapabilitiesSchema,
+} from "@cp/capabilities";
+import {
   correlationMiddleware,
   errorMiddleware,
   errorHandler,
@@ -32,6 +36,7 @@ import {
 import { createPlatformRoutes } from "./handlers.ts";
 import { createAuthRoutes } from "./handlers-auth.ts";
 import { createProjectRoutes } from "./handlers-projects.ts";
+import { createCapabilityRoutes } from "./handlers-capabilities.ts";
 import {
   IdempotencyStore,
   migrateIdempotencySchema,
@@ -43,14 +48,15 @@ export interface Api {
   auth: AuthService;
   orgs: OrganizationsService;
   projects: ProjectsService;
+  capabilities: CapabilitiesService;
   idempotency: IdempotencyStore;
   /**
-   * Create or update the /auth + /organizations + /projects + idempotency
-   * schema on the configured database. Idempotent. Safe to call on every
-   * startup. Must be called before auth/org/project routes will function.
-   * Throws on DB failure so misconfiguration is explicit (no silent
-   * no-schema fallback) — the serve() readiness gate refuses to bind the
-   * HTTP listener if this fails.
+   * Create or update the /auth + /organizations + /projects + capabilities
+   * + idempotency schema on the configured database. Idempotent. Safe to
+   * call on every startup. Must be called before auth/org/project/
+   * capability routes will function. Throws on DB failure so
+   * misconfiguration is explicit (no silent no-schema fallback) — the
+   * serve() readiness gate refuses to bind the HTTP listener if this fails.
    */
   migrate(): Promise<void>;
 }
@@ -83,6 +89,10 @@ export function createApi(
     db: runtime.db,
     logger: runtime.logger,
   });
+  const capabilities = new CapabilitiesService({
+    db: runtime.db,
+    logger: runtime.logger,
+  });
   const idempotency = new IdempotencyStore({
     db: runtime.db,
     logger: runtime.logger,
@@ -101,6 +111,12 @@ export function createApi(
   // org-level gate (orgContextMiddleware) runs first; the project-level
   // gate (projectContextMiddleware) runs for :projectId routes.
   createProjectRoutes({ runtime, orgs, projects, idempotency }, app);
+  // WORK-005 capability routes under /v1/capabilities. These are GLOBAL
+  // (not tenant-scoped): the auth middleware verifies the credential and
+  // builds the Principal; mutation routes require the CP-level
+  // capability-admin grant (checked inside CapabilitiesService); read
+  // routes are authenticated-only.
+  createCapabilityRoutes({ runtime, auth, orgs, capabilities, idempotency }, app);
 
   // Start the in-process worker so enqueued jobs actually run.
   runtime.queue.start();
@@ -109,19 +125,21 @@ export function createApi(
     await migrateAuthSchema(runtime.db as Database);
     await migrateOrganizationsSchema(runtime.db as Database);
     await migrateProjectsSchema(runtime.db as Database);
+    await migrateCapabilitiesSchema(runtime.db as Database);
     await migrateIdempotencySchema(runtime.db as Database);
   };
 
-  return { app, runtime, auth, orgs, projects, idempotency, migrate };
+  return { app, runtime, auth, orgs, projects, capabilities, idempotency, migrate };
 }
 
 export interface ServeOptions extends RuntimeOptions {
   port: number;
   hostname?: string;
   /**
-   * When true, run the /auth + /organizations + /projects + idempotency
-   * schema migrations before binding the HTTP listener. This enforces the
-   * required startup/readiness order (architect review of WORK-003):
+   * When true, run the /auth + /organizations + /projects + capabilities
+   * + idempotency schema migrations before binding the HTTP listener. This
+   * enforces the required startup/readiness order (architect review of
+   * WORK-003):
    *
    *   config -> infrastructure -> migrations -> migration success?
    *                                               |- no  -> startup failure / no readiness
