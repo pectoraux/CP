@@ -65,9 +65,12 @@ export interface PlatformConfig {
    * is created. The normal tenant API (POST /v1/capabilities/admins) does
    * NOT self-bootstrap on an empty table — it requires an EXISTING
    * capability admin to grant another. The bootstrap grant runs once at
-   * serve() startup, AFTER migrations succeed, and only when the admin
-   * table is empty (idempotent no-op on re-deploys). A null/empty value
-   * means no startup bootstrap is performed.
+   * serve() startup, AFTER migrations succeed; the claim + grant are a
+   * single atomic database statement over a singleton row, so concurrent
+   * instances can never create two bootstrap admins. When any admin
+   * already exists (re-deploy, env-var change, or pre-fix installation)
+   * the bootstrap is a no-op. A null/empty value means no startup
+   * bootstrap is performed.
    *
    * This is a deployment-authority surface, NOT a tenant API. It is never
    * exposed over HTTP. The user_id must already exist in cp_users (the

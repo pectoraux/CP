@@ -183,18 +183,22 @@ export async function serve(opts: ServeOptions): Promise<ServedApi> {
   // CAPABILITY-ADMIN BOOTSTRAP (architect review of PR #4 / WORK-005 §22):
   // the FIRST capability admin is granted by the DEPLOYMENT/OPERATOR
   // authority (CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID), never by the normal
-  // tenant API. This runs AFTER the migration gate (the table must exist)
+  // tenant API. This runs AFTER the migration gate (the tables must exist)
   // and BEFORE the HTTP listener is bound. Authority model:
   //
   //   deployment/bootstrap configuration → initial capability admin
   //            → normal capability-admin API → subsequent admin grants
   //
-  // bootstrapCapabilityAdmin only grants when the admin table is empty
-  // (idempotent no-op on re-deploys), so an env-var change cannot silently
-  // add new admins to an already-bootstrapped installation. A DB failure
-  // here aborts startup (same fatal path as a migration failure): the
-  // operator asked for a bootstrap, and a silent skip would create a
-  // security gap where they believe an admin exists when it does not.
+  // The claim + grant are ONE atomic database statement over a singleton
+  // row (constant-TRUE primary key — architect review #2 of PR #4), so
+  // two instances of this process racing with different bootstrap users
+  // can NEVER create two bootstrap admins: exactly one claim row can ever
+  // exist. When any admin already exists (re-deploy, env-var change, or a
+  // pre-fix installation), the bootstrap is a logged no-op — an env-var
+  // change can never silently add new admins. A DB failure here aborts
+  // startup (same fatal path as a migration failure): the operator asked
+  // for a bootstrap, and a silent skip would create a security gap where
+  // they believe an admin exists when it does not.
   const bootstrapUserId =
     runtimeOptions.config?.bootstrapCapabilityAdminUserId;
   if (bootstrapUserId) {

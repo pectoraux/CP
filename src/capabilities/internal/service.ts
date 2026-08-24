@@ -32,6 +32,12 @@
 // admin to grant another. A tenant user cannot bootstrap themselves into
 // global catalog administration merely because the installation is new.
 //
+// Bootstrap atomicity (architect review #2 of PR #4): the first-admin
+// claim is a SINGLETON database row (constant-TRUE primary key) claimed
+// and granted in ONE atomic SQL statement, so concurrent bootstrap calls
+// (e.g. two serve() instances racing with different users) can never
+// produce two bootstrap admins — exactly one claim row can ever exist.
+//
 // Immutability (WORK-005 §18): once a capability version reaches status
 // 'active' (published), its contract fields are IMMUTABLE. The service
 // exposes NO path that updates input_schema/output_schema/error_model/
@@ -422,14 +428,12 @@ export class CapabilitiesService {
    * Bootstrap the FIRST capability-admin grant on a fresh installation.
    * This is the DEPLOYMENT/OPERATOR authority path (WORK-005 §22
    * correction): it is NOT exposed over HTTP, has NO acting principal,
-   * and only grants when the cp_capability_admins table is EMPTY. When
-   * the table already has admins, this is an idempotent no-op (logged)
-   * so re-deploys and config-reloads do not grant new admins.
+   * and only grants when cp_capability_admins is EMPTY. When an admin
+   * already exists, this is an idempotent no-op (logged) so re-deploys
+   * and config-reloads never grant new admins.
    *
    * The granted_by_user_id column is NULL — this is the deployment
-   * authority, not a user-mediated grant. The grant is idempotent
-   * (INSERT ... ON CONFLICT DO NOTHING) so concurrent calls (e.g. two
-   * serve() instances racing) are safe.
+   * authority, not a user-mediated grant.
    *
    * Authority model:
    *
@@ -440,6 +444,42 @@ export class CapabilitiesService {
    *     normal capability-admin API (grantCapabilityAdmin)
    *               ↓
    *     subsequent admin grants
+   *
+   * ATOMICITY (architect review #2 of PR #4): the first-admin claim is
+   * made AT THE DATABASE LEVEL, in ONE atomic statement — a check-then-
+   * insert sequence can never be safe here:
+   *
+   *     Instance A: SELECT → empty     Instance B: SELECT → empty
+   *     A: INSERT admin(A)             B: INSERT admin(B)
+   *     → TWO bootstrap admins (A and B have different PKs, so
+   *       ON CONFLICT (user_id, permission) cannot dedupe them)
+   *
+   * Instead, cp_capability_admin_bootstrap is a SINGLETON table whose
+   * PRIMARY KEY is the constant TRUE. All bootstrap attempts conflict on
+   * that one key regardless of the user_id they carry, so the claim below
+   * is the serialization point:
+   *
+   *   WITH claim AS (
+   *     INSERT INTO cp_capability_admin_bootstrap ... VALUES (TRUE, $user)
+   *       ON CONFLICT (singleton) DO NOTHING RETURNING user_id
+   *   )
+   *   INSERT INTO cp_capability_admins
+   *   SELECT ... FROM claim WHERE NOT EXISTS (SELECT 1 FROM cp_capability_admins)
+   *
+   * PostgreSQL blocks the loser's claim INSERT on the winner's uncommitted
+   * singleton tuple until the winner's whole statement commits; the loser
+   * then takes the DO NOTHING path, its `claim` CTE is empty, and its
+   * admin INSERT selects zero rows. Both the claim and the grant commit
+   * together (single-statement atomicity), so exactly ONE bootstrap
+   * admin can ever exist. The WHERE NOT EXISTS guard additionally
+   * refuses to grant when an admin already exists without a claim row —
+   * the upgrade path where a pre-fix installation already has its first
+   * admin (the claim is recorded but NO admin is granted).
+   *
+   * Only the claim winner can reach the admin INSERT, and the claim can
+   * be won exactly once EVER, so the guard cannot race with another
+   * bootstrap; normal-API grants require an existing admin, so they
+   * cannot race an empty admin table either.
    *
    * Returns the outcome so the caller (serve()) can log/observe it.
    */
@@ -454,45 +494,52 @@ export class CapabilitiesService {
       });
     }
     const source = input.source ?? "deployment-config";
-    const isEmpty = await this.adminTableEmpty();
-    if (!isEmpty) {
-      // The table already has at least one admin. The deployment-config
-      // bootstrap is a one-time initial-admin mechanism; it does NOT
-      // grant new admins on re-deploys (that would let an env-var change
-      // silently add admins). Idempotent no-op + log for observability.
-      this.logger.info("capabilities: bootstrap skipped — admin table not empty", {
+
+    // ONE atomic statement: (1) claim the single permanent bootstrap slot
+    // (the singleton PK serializes every concurrent attempt), and
+    // (2) grant the admin row IFF this call won the claim AND no admin
+    // already exists. A row is returned only when THIS call granted the
+    // admin; every other outcome returns zero rows.
+    const grantedRows = await this.db.query({
+      text: `WITH claim AS (
+               INSERT INTO cp_capability_admin_bootstrap (singleton, user_id, source)
+               VALUES (TRUE, $1, $2)
+               ON CONFLICT (singleton) DO NOTHING
+               RETURNING user_id
+             )
+             INSERT INTO cp_capability_admins (user_id, permission, granted_by_user_id)
+             SELECT claim.user_id, 'capability.manage', NULL
+             FROM claim
+             WHERE NOT EXISTS (SELECT 1 FROM cp_capability_admins)
+             ON CONFLICT (user_id, permission) DO NOTHING
+             RETURNING user_id`,
+      params: [userId, source],
+    });
+
+    if (grantedRows.length === 1) {
+      this.logger.info("capabilities: bootstrap capability-admin", {
         bootstrap_user_id: userId,
         source,
+        granted: true,
+        reason: "granted",
       });
-      return { granted: false, reason: "table_not_empty" };
+      return { granted: true, reason: "granted" };
     }
-    // The table is empty. Idempotent insert; if a concurrent bootstrap
-    // raced and won, ON CONFLICT DO NOTHING makes this a no-op.
-    await this.db.exec({
-      text: `INSERT INTO cp_capability_admins (user_id, permission, granted_by_user_id)
-             VALUES ($1, 'capability.manage', NULL)
-             ON CONFLICT (user_id, permission) DO NOTHING`,
-      params: [userId],
-    });
-    // Re-check emptiness to determine whether THIS call actually granted
-    // (handles the concurrent-race case where another bootstrap won).
-    const stillEmptyAfter = await this.adminTableEmpty();
-    const granted = !stillEmptyAfter;
-    this.logger.info("capabilities: bootstrap capability-admin", {
+
+    // No admin was granted by this call: either another bootstrap owns
+    // the singleton claim (concurrent loser or re-deploy), or an admin
+    // already exists (pre-fix installation / normal-API grants). The
+    // end state is identical either way — no new admin was created.
+    // Determine the reason for observability only.
+    const isAlreadyAdmin = await this.isCapabilityAdmin(userId);
+    const reason = isAlreadyAdmin ? "already_present" : "table_not_empty";
+    this.logger.info("capabilities: bootstrap capability-admin not applied", {
       bootstrap_user_id: userId,
       source,
-      granted,
-      reason: granted ? "granted" : "already_present",
+      granted: false,
+      reason,
     });
-    return { granted, reason: granted ? "granted" : "already_present" };
-  }
-
-  private async adminTableEmpty(): Promise<boolean> {
-    const rows = await this.db.query({
-      text: `SELECT 1 FROM cp_capability_admins LIMIT 1`,
-      params: [],
-    });
-    return rows.length === 0;
+    return { granted: false, reason };
   }
 
   /**

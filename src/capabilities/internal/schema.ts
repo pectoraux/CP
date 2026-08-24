@@ -156,4 +156,31 @@ export const CAP_SCHEMA_STATEMENTS: readonly string[] = [
     granted_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT cp_capability_admins_pk PRIMARY KEY (user_id, permission)
   )`,
+
+  // ---- First-admin bootstrap claim (singleton, atomic) ------------------
+  // Architect review #2 of PR #4: the FIRST capability-admin bootstrap must
+  // be atomic AT THE DATABASE LEVEL. The prior check-then-insert
+  // implementation (SELECT emptiness → INSERT) allowed two concurrent
+  // instances with DIFFERENT user_ids to both observe an empty
+  // cp_capability_admins and both insert their own bootstrap admin —
+  // ON CONFLICT (user_id, permission) could not help because the two rows
+  // have different primary keys.
+  //
+  // This table can contain AT MOST ONE row EVER: its PRIMARY KEY is the
+  // constant TRUE (the CHECK rejects any other value). Concurrent bootstrap
+  // attempts therefore conflict on this single key REGARDLESS of the
+  // user_id they carry. PostgreSQL serializes concurrent inserts of the
+  // same key: the loser's INSERT ... ON CONFLICT (singleton) DO NOTHING
+  // blocks until the winner's statement commits, then resolves to a no-op.
+  // Exactly one claim row can ever exist → exactly one bootstrap admin can
+  // ever be granted by the deployment mechanism.
+  //
+  // The row is also the audit record of WHO bootstrapped the installation
+  // (user_id + source + created_at).
+  `CREATE TABLE IF NOT EXISTS cp_capability_admin_bootstrap (
+    singleton  BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    user_id    TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'deployment-config',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
 ];

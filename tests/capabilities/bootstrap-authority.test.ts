@@ -1,13 +1,9 @@
 // tests/capabilities/bootstrap-authority.test.ts — WORK-005 §22 authority
-// correction proof (architect review of PR #4, CHANGES REQUESTED).
+// proofs (architect reviews of PR #4).
 //
-// The capability-admin grant is a CP-level platform-admin authority. The
-// previous implementation allowed ANY authenticated principal to grant the
-// first admin whenever cp_capability_admins was empty — meaning a tenant
-// user could bootstrap themselves into global catalog administration
-// merely because the installation was new. This file proves the corrected
-// authority model end-to-end against REAL PostgreSQL and a REAL HTTP
-// socket:
+// Review #1 — the capability-admin grant is a CP-level platform-admin
+// authority; no tenant self-bootstrap. Proven end-to-end against REAL
+// PostgreSQL and a REAL HTTP socket:
 //
 //   (a) fresh installation + ordinary user
 //         → cannot become capability admin (403, stays non-admin)
@@ -19,11 +15,23 @@
 //   (c) existing capability admin
 //         → can grant another capability admin over the normal API
 //
+// Review #2 — the first-admin bootstrap must be ATOMIC at the database
+// level (the prior check-then-insert allowed two concurrent instances
+// with different users to both observe an empty table and both insert):
+//
+//   (d) two simultaneous bootstrap calls (different users)
+//         → exactly ONE admin (10 interleavings; service level)
+//   (e) two simultaneous bootstrap calls (same user)
+//         → exactly one admin row; both resolve without error
+//   (f) two concurrent serve() instances with different bootstrap users
+//         → exactly one bootstrap admin (the instance A/B scenario)
+//   (g) pre-fix installation (admin exists, no claim row)
+//         → changing the bootstrap user adds NO new admin
+//
 // Additional invariants proven here:
-//   - the deployment bootstrap is a ONE-TIME initial-admin mechanism: when
-//     the admin table is already populated, restarting serve() with a
-//     different CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID does NOT grant that
-//     user (an env-var change cannot silently add admins)
+//   - the deployment bootstrap is a ONE-TIME initial-admin mechanism: once
+//     any admin exists (or the singleton claim is taken), restarting with
+//     a different CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID adds no admin
 //   - the service-level normal grant path (grantCapabilityAdmin) has NO
 //     empty-table bypass — it throws POLICY_BLOCKED for a non-admin actor
 //     even when the table is empty
@@ -34,7 +42,7 @@ import { withInfra } from "../infra/harness.ts";
 import { PostgresDatabase, AppError } from "@cp/platform";
 import { AuthService, migrateAuthSchema, buildPrincipal } from "@cp/auth";
 import { CapabilitiesService, migrateCapabilitiesSchema } from "@cp/capabilities";
-import { serve } from "@cp/api";
+import { serve, createApi } from "@cp/api";
 
 /** Create a user directly via the auth service (pre-listener). */
 async function makeUser(db: PostgresDatabase, email: string) {
@@ -313,10 +321,12 @@ describe("WORK-005 capability-admin bootstrap authority (PR #4 correction)", () 
         const r1 = await capabilities.bootstrapCapabilityAdmin({ userId: u1.id });
         expect(r1.granted).toBe(true);
         expect(r1.reason).toBe("granted");
-        // Re-running the SAME bootstrap (same user) is a safe no-op.
+        // Re-running the SAME bootstrap (same user) is a safe no-op: the
+        // singleton claim is already taken by u1 and u1 is already the
+        // admin — nothing changes.
         const r2 = await capabilities.bootstrapCapabilityAdmin({ userId: u1.id });
         expect(r2.granted).toBe(false);
-        expect(r2.reason).toBe("table_not_empty");
+        expect(r2.reason).toBe("already_present");
         // Bootstrapping a DIFFERENT user once the table is populated is
         // also refused — the deployment config is a one-time
         // initial-admin mechanism, not a standing grant source.
@@ -335,6 +345,266 @@ describe("WORK-005 capability-admin bootstrap authority (PR #4 correction)", () 
           expect((e as AppError).code).toBe("capability.validation");
         }
         expect(threw).toBe(true);
+      } finally {
+        await db.close();
+      }
+    });
+  }, 120_000);
+
+  // ---------------------------------------------------------------------
+  // Architect review #2 of PR #4 — the first-admin bootstrap must be
+  // ATOMIC at the database level. The prior check-then-insert race:
+  //
+  //     Instance A: SELECT → empty    Instance B: SELECT → empty
+  //     A: INSERT admin(A)            B: INSERT admin(B)
+  //     → TWO bootstrap admins (different PKs; ON CONFLICT cannot help)
+  //
+  // The fix is a singleton claim table (constant-TRUE primary key) whose
+  // claim and grant are ONE atomic SQL statement. These tests prove the
+  // invariant end-to-end: two simultaneous bootstrap calls → exactly ONE
+  // admin — at the service level (same pool), across two pools, and
+  // across two full serve() instances.
+  // ---------------------------------------------------------------------
+  it("concurrency: two simultaneous bootstrap calls (different users) → exactly ONE admin (10 interleavings)", async () => {
+    await withInfra(async (handle) => {
+      const db = new PostgresDatabase({
+        connectionString: handle.pg.connectionString,
+        applicationName: "cp-test-bootstrap-race-diff",
+      });
+      await migrateAuthSchema(db);
+      await migrateCapabilitiesSchema(db);
+      const u1 = await makeUser(db, `race-d1-${Date.now()}@e.com`);
+      const u2 = await makeUser(db, `race-d2-${Date.now()}@e.com`);
+      const capabilities = new CapabilitiesService({ db });
+      try {
+        for (let i = 0; i < 10; i++) {
+          // Reset both the admin table AND the singleton claim so each
+          // iteration re-races the check-then-insert window.
+          await db.exec({
+            text: `TRUNCATE cp_capability_admins, cp_capability_admin_bootstrap`,
+            params: [],
+          });
+          // Warm the pool with several idle connections. The sequential
+          // setup above leaves exactly ONE idle client; without warming,
+          // the second bootstrap's first query would block on
+          // new-connection setup while the first completes, serializing
+          // the two calls and hiding the race. With ≥2 warm clients both
+          // bootstraps dispatch their first statement immediately and
+          // genuinely overlap at the database.
+          await Promise.all([
+            db.query({ text: "SELECT 1", params: [] }),
+            db.query({ text: "SELECT 1", params: [] }),
+            db.query({ text: "SELECT 1", params: [] }),
+            db.query({ text: "SELECT 1", params: [] }),
+          ]);
+          const [r1, r2] = await Promise.all([
+            capabilities.bootstrapCapabilityAdmin({ userId: u1.id }),
+            capabilities.bootstrapCapabilityAdmin({ userId: u2.id }),
+          ]);
+          // Exactly one call reports a grant; neither throws.
+          const grantedCount = [r1, r2].filter((r) => r.granted).length;
+          expect(grantedCount).toBe(1);
+          const loser = [r1, r2].find((r) => !r.granted)!;
+          expect(["already_present", "table_not_empty"]).toContain(loser.reason);
+          // Exactly ONE admin row exists.
+          const admins = await db.query({
+            text: `SELECT user_id FROM cp_capability_admins`,
+            params: [],
+          });
+          expect(admins.length).toBe(1);
+          const winnerId = (admins[0] as { user_id: string }).user_id;
+          expect([u1.id, u2.id]).toContain(winnerId);
+          // The winner is an admin; the loser is not.
+          expect(await capabilities.isCapabilityAdmin(winnerId)).toBe(true);
+          const loserUserId = winnerId === u1.id ? u2.id : u1.id;
+          expect(await capabilities.isCapabilityAdmin(loserUserId)).toBe(false);
+          // Exactly ONE singleton claim row exists, naming the winner.
+          const claims = await db.query({
+            text: `SELECT user_id FROM cp_capability_admin_bootstrap WHERE singleton = TRUE`,
+            params: [],
+          });
+          expect(claims.length).toBe(1);
+          expect((claims[0] as { user_id: string }).user_id).toBe(winnerId);
+        }
+      } finally {
+        await db.close();
+      }
+    });
+  }, 180_000);
+
+  it("concurrency: two simultaneous bootstrap calls (SAME user) → exactly one admin row; both resolve without error", async () => {
+    await withInfra(async (handle) => {
+      const db = new PostgresDatabase({
+        connectionString: handle.pg.connectionString,
+        applicationName: "cp-test-bootstrap-race-same",
+      });
+      await migrateAuthSchema(db);
+      await migrateCapabilitiesSchema(db);
+      const u = await makeUser(db, `race-same-${Date.now()}@e.com`);
+      const capabilities = new CapabilitiesService({ db });
+      try {
+        // Warm the pool (see the different-users test above) so the two
+        // calls genuinely overlap at the database.
+        await Promise.all([
+          db.query({ text: "SELECT 1", params: [] }),
+          db.query({ text: "SELECT 1", params: [] }),
+          db.query({ text: "SELECT 1", params: [] }),
+          db.query({ text: "SELECT 1", params: [] }),
+        ]);
+        const [r1, r2] = await Promise.all([
+          capabilities.bootstrapCapabilityAdmin({ userId: u.id }),
+          capabilities.bootstrapCapabilityAdmin({ userId: u.id }),
+        ]);
+        // One grants; the other is an idempotent no-op (already_present).
+        expect([r1, r2].filter((r) => r.granted).length).toBe(1);
+        expect([r1, r2].find((r) => !r.granted)!.reason).toBe("already_present");
+        // Exactly ONE admin row (the same user), ONE claim row.
+        const admins = await db.query({
+          text: `SELECT user_id FROM cp_capability_admins`,
+          params: [],
+        });
+        expect(admins.length).toBe(1);
+        expect((admins[0] as { user_id: string }).user_id).toBe(u.id);
+        const claims = await db.query({
+          text: `SELECT user_id FROM cp_capability_admin_bootstrap`,
+          params: [],
+        });
+        expect(claims.length).toBe(1);
+      } finally {
+        await db.close();
+      }
+    });
+  }, 120_000);
+
+  it("concurrency: two serve() instances racing with DIFFERENT bootstrap users → exactly one bootstrap admin (both healthy)", async () => {
+    await withInfra(async (handle) => {
+      // Pre-create the FULL schema set (auth + organizations + projects +
+      // capabilities + idempotency) via one connection first. Without this,
+      // the two instances' concurrent autoMigrate would race to CREATE the
+      // missing tables — PostgreSQL's well-known concurrent-DDL catalog
+      // race (pg_type_typname_nsp_index), which is NOT the behavior under
+      // test. With every object pre-created, both instances' autoMigrate
+      // re-runs are idempotent no-ops, and the bootstrap claims themselves
+      // race for real.
+      const setupDb = new PostgresDatabase({
+        connectionString: handle.pg.connectionString,
+        applicationName: "cp-test-bootstrap-race-setup",
+      });
+      const setupApi = createApi({ db: setupDb });
+      await setupApi.migrate();
+      await setupApi.runtime.queue.stop();
+      const userA = await makeUser(setupDb, `race-inst-a-${Date.now()}@e.com`);
+      const userB = await makeUser(setupDb, `race-inst-b-${Date.now()}@e.com`);
+      await setupDb.close();
+
+      // Two independent instances: separate pools, separate listeners,
+      // DIFFERENT CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID values — the
+      // architect's exact instance-A / instance-B scenario.
+      const dbA = new PostgresDatabase({
+        connectionString: handle.pg.connectionString,
+        applicationName: "cp-test-bootstrap-race-A",
+      });
+      const dbB = new PostgresDatabase({
+        connectionString: handle.pg.connectionString,
+        applicationName: "cp-test-bootstrap-race-B",
+      });
+      const portA = randomPort();
+      const portB = randomPort();
+      let apiA: Awaited<ReturnType<typeof serve>> | undefined;
+      let apiB: Awaited<ReturnType<typeof serve>> | undefined;
+      try {
+        [apiA, apiB] = await Promise.all([
+          serve({
+            port: portA,
+            hostname: "127.0.0.1",
+            db: dbA,
+            autoMigrate: true,
+            config: { mode: "test", bootstrapCapabilityAdminUserId: userA.id },
+          }),
+          serve({
+            port: portB,
+            hostname: "127.0.0.1",
+            db: dbB,
+            autoMigrate: true,
+            config: { mode: "test", bootstrapCapabilityAdminUserId: userB.id },
+          }),
+        ]);
+
+        // Both instances came up healthy.
+        const hA = await fetch(`http://127.0.0.1:${portA}/v1/platform/health`);
+        expect(hA.status).toBe(200);
+        const hB = await fetch(`http://127.0.0.1:${portB}/v1/platform/health`);
+        expect(hB.status).toBe(200);
+
+        // Exactly ONE bootstrap admin exists — not one per instance.
+        const admins = await dbA.query({
+          text: `SELECT user_id FROM cp_capability_admins`,
+          params: [],
+        });
+        expect(admins.length).toBe(1);
+        const winnerId = (admins[0] as { user_id: string }).user_id;
+        expect([userA.id, userB.id]).toContain(winnerId);
+        const loserId = winnerId === userA.id ? userB.id : userA.id;
+
+        const capabilities = new CapabilitiesService({ db: dbA });
+        expect(await capabilities.isCapabilityAdmin(winnerId)).toBe(true);
+        expect(await capabilities.isCapabilityAdmin(loserId)).toBe(false);
+
+        // The singleton claim is recorded exactly once, naming the winner.
+        const claims = await dbA.query({
+          text: `SELECT user_id FROM cp_capability_admin_bootstrap WHERE singleton = TRUE`,
+          params: [],
+        });
+        expect(claims.length).toBe(1);
+        expect((claims[0] as { user_id: string }).user_id).toBe(winnerId);
+      } finally {
+        if (apiA) await apiA.stop();
+        if (apiB) await apiB.stop();
+        await dbA.close();
+        await dbB.close();
+      }
+    });
+  }, 180_000);
+
+  it("pre-fix installation (admin exists, no bootstrap claim row) → changing the bootstrap user adds NO new admin", async () => {
+    await withInfra(async (handle) => {
+      const db = new PostgresDatabase({
+        connectionString: handle.pg.connectionString,
+        applicationName: "cp-test-bootstrap-prefixup",
+      });
+      await migrateAuthSchema(db);
+      await migrateCapabilitiesSchema(db);
+      const legacyAdmin = await makeUser(db, `legacy-${Date.now()}@e.com`);
+      const newUser = await makeUser(db, `newboot-${Date.now()}@e.com`);
+      const thirdUser = await makeUser(db, `thirdboot-${Date.now()}@e.com`);
+      // Simulate a pre-fix installation: the original (racy) bootstrap
+      // code granted an admin WITHOUT recording a singleton claim row.
+      // Upgrading must not let a new env-var value add a second admin.
+      await db.exec({
+        text: `INSERT INTO cp_capability_admins (user_id, permission, granted_by_user_id)
+               VALUES ($1, 'capability.manage', NULL)`,
+        params: [legacyAdmin.id],
+      });
+      const capabilities = new CapabilitiesService({ db });
+      try {
+        // First attempt with a NEW user: the claim may be won (no claim
+        // row exists) but the admin table is populated — NO grant.
+        const r1 = await capabilities.bootstrapCapabilityAdmin({ userId: newUser.id });
+        expect(r1.granted).toBe(false);
+        expect(r1.reason).toBe("table_not_empty");
+        // A second attempt (yet another user) is also refused — the
+        // claim is now recorded, so it loses outright.
+        const r2 = await capabilities.bootstrapCapabilityAdmin({ userId: thirdUser.id });
+        expect(r2.granted).toBe(false);
+        // Still exactly ONE admin: the legacy one.
+        const admins = await db.query({
+          text: `SELECT user_id FROM cp_capability_admins`,
+          params: [],
+        });
+        expect(admins.length).toBe(1);
+        expect((admins[0] as { user_id: string }).user_id).toBe(legacyAdmin.id);
+        expect(await capabilities.isCapabilityAdmin(newUser.id)).toBe(false);
+        expect(await capabilities.isCapabilityAdmin(thirdUser.id)).toBe(false);
       } finally {
         await db.close();
       }
