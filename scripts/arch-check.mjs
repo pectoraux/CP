@@ -151,11 +151,39 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "goals",
     ]),
   ],
-  // Upstream modules must not import /policies (no cycles): capability
-  // semantics, provider identity, and catalog facts are upstream of
-  // tenant policy configuration.
-  ["capabilities", new Set(["providers", "catalog", "policies"])],
-  ["providers", new Set(["routing", "optimization", "experiments", "catalog", "policies"])],
+  // WORK-009 §25: /eligibility is the deterministic candidate
+  // evaluation layer. It consumes policies + catalog + capabilities +
+  // providers PUBLIC interfaces but must NEVER import the downstream
+  // decision layers (strategy/routing/execution/optimization/
+  // experimentation) or any premature module — those layers CONSUME
+  // eligibility results.
+  [
+    "eligibility",
+    new Set([
+      "routing",
+      "optimization",
+      "experiments",
+      "executions",
+      "plans",
+      "strategies",
+      "observations",
+      "outcomes",
+      "evidence",
+      "connections",
+      "resources",
+      "webhooks",
+      "events",
+      "audit",
+      "llm",
+      "agents",
+      "goals",
+    ]),
+  ],
+  // Upstream modules must not import /policies or /eligibility (no
+  // cycles): capability semantics, provider identity, catalog facts,
+  // and policy rules are upstream of candidate evaluation.
+  ["capabilities", new Set(["providers", "catalog", "policies", "eligibility"])],
+  ["providers", new Set(["routing", "optimization", "experiments", "catalog", "policies", "eligibility"])],
   // WORK-007 §22: /catalog is the normalized marketplace PROJECTION — it
   // consumes capabilities + providers public interfaces and owns only
   // marketplace facts. It must never import the downstream decision

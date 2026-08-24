@@ -34,6 +34,7 @@ import {
 } from "@cp/providers";
 import { CatalogService, migrateCatalogSchema } from "@cp/catalog";
 import { PoliciesService, migratePoliciesSchema } from "@cp/policies";
+import { EligibilityService } from "@cp/eligibility";
 import {
   correlationMiddleware,
   errorMiddleware,
@@ -47,6 +48,7 @@ import { createCapabilityRoutes } from "./handlers-capabilities.ts";
 import { createProviderRoutes } from "./handlers-providers.ts";
 import { createCatalogRoutes } from "./handlers-catalog.ts";
 import { createPolicyRoutes } from "./handlers-policies.ts";
+import { createEligibilityRoutes } from "./handlers-eligibility.ts";
 import {
   IdempotencyStore,
   migrateIdempotencySchema,
@@ -62,6 +64,7 @@ export interface Api {
   providers: ProvidersService;
   catalog: CatalogService;
   policies: PoliciesService;
+  eligibility: EligibilityService;
   idempotency: IdempotencyStore;
   /**
    * Create or update the /auth + /organizations + /projects + capabilities
@@ -144,6 +147,20 @@ export function createApi(
     db: runtime.db,
     logger: runtime.logger,
   });
+  // WORK-009: the eligibility engine consumes the PUBLIC policy
+  // evaluator, the PUBLIC catalog offering projection, the PUBLIC
+  // capabilities interface, and the PUBLIC projects interface (project
+  // existence/tenant ownership — architect review of PR #8). It is
+  // STATELESS (no tables, no cache, no direct Database dependency) and
+  // its core evaluator is pure — it never invokes provider adapters or
+  // chooses winners.
+  const eligibility = new EligibilityService({
+    logger: runtime.logger,
+    capabilities,
+    catalog,
+    policies,
+    projects,
+  });
   const idempotency = new IdempotencyStore({
     db: runtime.db,
     logger: runtime.logger,
@@ -191,6 +208,12 @@ export function createApi(
   // Evaluation is read-only against an explicit version with a
   // caller-supplied context.
   createPolicyRoutes({ runtime, auth, orgs, projects, policies, idempotency }, app);
+  // WORK-009 eligibility route under the project scope
+  // (/v1/organizations/:orgId/projects/:projectId/eligibility/evaluate).
+  // The standard WORK-004 tenant gates run first; the service re-verifies
+  // membership and loads the policy ONLY within the authorized project
+  // scope. Evaluation is read-only, explainable, and produces NO ranking.
+  createEligibilityRoutes({ runtime, auth, orgs, projects, eligibility, idempotency }, app);
 
   // Start the in-process worker so enqueued jobs actually run.
   runtime.queue.start();
@@ -206,7 +229,7 @@ export function createApi(
     await migrateIdempotencySchema(runtime.db as Database);
   };
 
-  return { app, runtime, auth, orgs, projects, capabilities, providers, catalog, policies, idempotency, migrate };
+  return { app, runtime, auth, orgs, projects, capabilities, providers, catalog, policies, eligibility, idempotency, migrate };
 }
 
 export interface ServeOptions extends RuntimeOptions {
