@@ -11,10 +11,7 @@ import {
   newExecutionId,
   type Runtime,
 } from "@cp/platform";
-
-interface Vars {
-  requestId: string;
-}
+import type { AuthVars } from "./middleware.ts";
 
 interface OperationInput {
   async_ms?: number;
@@ -29,7 +26,7 @@ const operationExecutions = new Map<string, string>();
 
 export function createPlatformRoutes(
   runtime: Runtime,
-  app: Hono<{ Variables: Vars }>,
+  app: Hono<{ Variables: AuthVars }>,
 ): void {
   // Register the demo job handler on the queue. The handler runs inside the
   // restored execution context, so any log it emits carries the originating
