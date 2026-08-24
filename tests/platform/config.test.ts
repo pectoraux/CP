@@ -117,4 +117,18 @@ describe("PlatformConfig / loadPlatformConfig", () => {
     }
     expect(threw).toBe(true);
   });
+
+  it("reads CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID into bootstrapCapabilityAdminUserId (trimmed)", () => {
+    const cfg = loadPlatformConfig({
+      CP_ENV: "development",
+      CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID: "  usr_abc123  ",
+    });
+    expect(cfg.bootstrapCapabilityAdminUserId).toBe("usr_abc123");
+  });
+
+  it("omits bootstrapCapabilityAdminUserId when unset, empty, or whitespace", () => {
+    expect(loadPlatformConfig({ CP_ENV: "development" }).bootstrapCapabilityAdminUserId).toBeUndefined();
+    expect(loadPlatformConfig({ CP_ENV: "development", CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID: "" }).bootstrapCapabilityAdminUserId).toBeUndefined();
+    expect(loadPlatformConfig({ CP_ENV: "development", CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID: "   " }).bootstrapCapabilityAdminUserId).toBeUndefined();
+  });
 });

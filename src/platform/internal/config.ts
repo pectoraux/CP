@@ -56,6 +56,27 @@ export interface PlatformConfig {
   database?: PostgresConfig;
   redis?: RedisConfig;
   storage?: StorageConfig;
+  /**
+   * Optional deployment/operator authority that bootstraps the FIRST
+   * capability admin on a fresh installation (WORK-005 §22 authority
+   * correction). Sourced from CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID.
+   *
+   * This is the ONLY mechanism by which the initial capability-admin grant
+   * is created. The normal tenant API (POST /v1/capabilities/admins) does
+   * NOT self-bootstrap on an empty table — it requires an EXISTING
+   * capability admin to grant another. The bootstrap grant runs once at
+   * serve() startup, AFTER migrations succeed; the claim + grant are a
+   * single atomic database statement over a singleton row, so concurrent
+   * instances can never create two bootstrap admins. When any admin
+   * already exists (re-deploy, env-var change, or pre-fix installation)
+   * the bootstrap is a no-op. A null/empty value means no startup
+   * bootstrap is performed.
+   *
+   * This is a deployment-authority surface, NOT a tenant API. It is never
+   * exposed over HTTP. The user_id must already exist in cp_users (the
+   * operator creates the user first, then points the deployment at them).
+   */
+  bootstrapCapabilityAdminUserId?: string;
 }
 
 function required(env: Record<string, string | undefined>, key: string): string {
@@ -240,7 +261,19 @@ export function loadPlatformConfig(
     });
   }
 
-  return { mode, database, redis, storage };
+  // ---- Capability-admin bootstrap (WORK-005 §22 authority correction) ---
+  // Optional deployment/operator authority. When set, serve() grants the
+  // named user the capability.manage permission at startup (idempotent,
+  // only when the admin table is empty). This is the ONLY path by which
+  // the first capability admin is created; the normal tenant API never
+  // self-bootstraps. Empty/whitespace is treated as unset.
+  const bootstrapRaw = env.CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID;
+  const bootstrapCapabilityAdminUserId =
+    bootstrapRaw !== undefined && bootstrapRaw.trim() !== ""
+      ? bootstrapRaw.trim()
+      : undefined;
+
+  return { mode, database, redis, storage, bootstrapCapabilityAdminUserId };
 }
 
 function buildPostgresConnectionString(

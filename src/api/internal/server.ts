@@ -24,6 +24,10 @@ import {
 } from "@cp/organizations";
 import { ProjectsService, migrateProjectsSchema } from "@cp/projects";
 import {
+  CapabilitiesService,
+  migrateCapabilitiesSchema,
+} from "@cp/capabilities";
+import {
   correlationMiddleware,
   errorMiddleware,
   errorHandler,
@@ -32,6 +36,7 @@ import {
 import { createPlatformRoutes } from "./handlers.ts";
 import { createAuthRoutes } from "./handlers-auth.ts";
 import { createProjectRoutes } from "./handlers-projects.ts";
+import { createCapabilityRoutes } from "./handlers-capabilities.ts";
 import {
   IdempotencyStore,
   migrateIdempotencySchema,
@@ -43,14 +48,15 @@ export interface Api {
   auth: AuthService;
   orgs: OrganizationsService;
   projects: ProjectsService;
+  capabilities: CapabilitiesService;
   idempotency: IdempotencyStore;
   /**
-   * Create or update the /auth + /organizations + /projects + idempotency
-   * schema on the configured database. Idempotent. Safe to call on every
-   * startup. Must be called before auth/org/project routes will function.
-   * Throws on DB failure so misconfiguration is explicit (no silent
-   * no-schema fallback) — the serve() readiness gate refuses to bind the
-   * HTTP listener if this fails.
+   * Create or update the /auth + /organizations + /projects + capabilities
+   * + idempotency schema on the configured database. Idempotent. Safe to
+   * call on every startup. Must be called before auth/org/project/
+   * capability routes will function. Throws on DB failure so
+   * misconfiguration is explicit (no silent no-schema fallback) — the
+   * serve() readiness gate refuses to bind the HTTP listener if this fails.
    */
   migrate(): Promise<void>;
 }
@@ -83,6 +89,10 @@ export function createApi(
     db: runtime.db,
     logger: runtime.logger,
   });
+  const capabilities = new CapabilitiesService({
+    db: runtime.db,
+    logger: runtime.logger,
+  });
   const idempotency = new IdempotencyStore({
     db: runtime.db,
     logger: runtime.logger,
@@ -101,6 +111,12 @@ export function createApi(
   // org-level gate (orgContextMiddleware) runs first; the project-level
   // gate (projectContextMiddleware) runs for :projectId routes.
   createProjectRoutes({ runtime, orgs, projects, idempotency }, app);
+  // WORK-005 capability routes under /v1/capabilities. These are GLOBAL
+  // (not tenant-scoped): the auth middleware verifies the credential and
+  // builds the Principal; mutation routes require the CP-level
+  // capability-admin grant (checked inside CapabilitiesService); read
+  // routes are authenticated-only.
+  createCapabilityRoutes({ runtime, auth, orgs, capabilities, idempotency }, app);
 
   // Start the in-process worker so enqueued jobs actually run.
   runtime.queue.start();
@@ -109,19 +125,21 @@ export function createApi(
     await migrateAuthSchema(runtime.db as Database);
     await migrateOrganizationsSchema(runtime.db as Database);
     await migrateProjectsSchema(runtime.db as Database);
+    await migrateCapabilitiesSchema(runtime.db as Database);
     await migrateIdempotencySchema(runtime.db as Database);
   };
 
-  return { app, runtime, auth, orgs, projects, idempotency, migrate };
+  return { app, runtime, auth, orgs, projects, capabilities, idempotency, migrate };
 }
 
 export interface ServeOptions extends RuntimeOptions {
   port: number;
   hostname?: string;
   /**
-   * When true, run the /auth + /organizations + /projects + idempotency
-   * schema migrations before binding the HTTP listener. This enforces the
-   * required startup/readiness order (architect review of WORK-003):
+   * When true, run the /auth + /organizations + /projects + capabilities
+   * + idempotency schema migrations before binding the HTTP listener. This
+   * enforces the required startup/readiness order (architect review of
+   * WORK-003):
    *
    *   config -> infrastructure -> migrations -> migration success?
    *                                               |- no  -> startup failure / no readiness
@@ -157,6 +175,52 @@ export async function serve(opts: ServeOptions): Promise<ServedApi> {
       });
       // The in-process worker was started by createApi(); stop it so the
       // process can exit cleanly on the caller's fatal-exit path.
+      await api.runtime.queue.stop().catch(() => {});
+      throw err;
+    }
+  }
+
+  // CAPABILITY-ADMIN BOOTSTRAP (architect review of PR #4 / WORK-005 §22):
+  // the FIRST capability admin is granted by the DEPLOYMENT/OPERATOR
+  // authority (CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID), never by the normal
+  // tenant API. This runs AFTER the migration gate (the tables must exist)
+  // and BEFORE the HTTP listener is bound. Authority model:
+  //
+  //   deployment/bootstrap configuration → initial capability admin
+  //            → normal capability-admin API → subsequent admin grants
+  //
+  // The claim + grant are ONE atomic database statement over a singleton
+  // row (constant-TRUE primary key — architect review #2 of PR #4), so
+  // two instances of this process racing with different bootstrap users
+  // can NEVER create two bootstrap admins: exactly one claim row can ever
+  // exist. When any admin already exists (re-deploy, env-var change, or a
+  // pre-fix installation), the bootstrap is a logged no-op — an env-var
+  // change can never silently add new admins. A DB failure here aborts
+  // startup (same fatal path as a migration failure): the operator asked
+  // for a bootstrap, and a silent skip would create a security gap where
+  // they believe an admin exists when it does not.
+  const bootstrapUserId =
+    runtimeOptions.config?.bootstrapCapabilityAdminUserId;
+  if (bootstrapUserId) {
+    try {
+      const result = await api.capabilities.bootstrapCapabilityAdmin({
+        userId: bootstrapUserId,
+        source: "deployment-config",
+      });
+      if (!result.granted) {
+        api.runtime.logger.info(
+          "api: capability-admin bootstrap not applied (admin table not empty)",
+          { bootstrap_user_id: bootstrapUserId, reason: result.reason },
+        );
+      }
+    } catch (err) {
+      api.runtime.logger.error(
+        "api: startup aborted — capability-admin bootstrap failed",
+        {
+          error: err instanceof Error ? err.message : String(err),
+          bootstrap_user_id: bootstrapUserId,
+        },
+      );
       await api.runtime.queue.stop().catch(() => {});
       throw err;
     }
