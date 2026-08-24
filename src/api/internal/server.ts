@@ -33,6 +33,7 @@ import {
   createDefaultAdapterRegistry,
 } from "@cp/providers";
 import { CatalogService, migrateCatalogSchema } from "@cp/catalog";
+import { PoliciesService, migratePoliciesSchema } from "@cp/policies";
 import {
   correlationMiddleware,
   errorMiddleware,
@@ -45,6 +46,7 @@ import { createProjectRoutes } from "./handlers-projects.ts";
 import { createCapabilityRoutes } from "./handlers-capabilities.ts";
 import { createProviderRoutes } from "./handlers-providers.ts";
 import { createCatalogRoutes } from "./handlers-catalog.ts";
+import { createPolicyRoutes } from "./handlers-policies.ts";
 import {
   IdempotencyStore,
   migrateIdempotencySchema,
@@ -59,19 +61,21 @@ export interface Api {
   capabilities: CapabilitiesService;
   providers: ProvidersService;
   catalog: CatalogService;
+  policies: PoliciesService;
   idempotency: IdempotencyStore;
   /**
    * Create or update the /auth + /organizations + /projects + capabilities
-   * + providers + catalog + idempotency schema on the configured database.
-   * Idempotent. Safe to call on every startup. Must be called before
-   * auth/org/project/capability/provider/catalog routes will function.
-   * Throws on DB failure so misconfiguration is explicit (no silent
-   * no-schema fallback) — the serve() readiness gate refuses to bind the
-   * HTTP listener if this fails.
+   * + providers + catalog + policies + idempotency schema on the configured
+   * database. Idempotent. Safe to call on every startup. Must be called
+   * before auth/org/project/capability/provider/catalog/policy routes will
+   * function. Throws on DB failure so misconfiguration is explicit (no
+   * silent no-schema fallback) — the serve() readiness gate refuses to bind
+   * the HTTP listener if this fails.
    *
-   * Ordering: the /providers migration references cp_capabilities and the
-   * /catalog migration references cp_provider_capabilities (cross-module
-   * FKs), so they run AFTER capabilities and providers respectively.
+   * Ordering: the /providers migration references cp_capabilities, the
+   * /catalog migration references cp_provider_capabilities, and the
+   * /policies migration references cp_projects (cross-module FKs), so each
+   * runs after its dependency.
    */
   migrate(): Promise<void>;
 }
@@ -131,6 +135,15 @@ export function createApi(
     logger: runtime.logger,
     capabilities,
   });
+  // WORK-008: the policy engine is tenant-scoped customer configuration
+  // (Organization → Project → Policies, architecture §34). It depends only
+  // on @cp/platform + @cp/auth (tenant authorization via the Principal's
+  // memberships); policy rules are constrained declarative data and the
+  // evaluator is pure. The service never selects providers.
+  const policies = new PoliciesService({
+    db: runtime.db,
+    logger: runtime.logger,
+  });
   const idempotency = new IdempotencyStore({
     db: runtime.db,
     logger: runtime.logger,
@@ -170,6 +183,14 @@ export function createApi(
   // are authenticated-only and mutations require the CP-level
   // capability-admin grant (checked inside CatalogService).
   createCatalogRoutes({ runtime, auth, orgs, catalog, idempotency }, app);
+  // WORK-008 policy routes under the project scope
+  // (/v1/organizations/:orgId/projects/:projectId/policies). The standard
+  // WORK-004 tenant gates run first (orgContextMiddleware resolves the
+  // AUTHORIZED org; projectContextMiddleware verifies project ∈ org); the
+  // service re-verifies membership + admin/owner role for mutations.
+  // Evaluation is read-only against an explicit version with a
+  // caller-supplied context.
+  createPolicyRoutes({ runtime, auth, orgs, projects, policies, idempotency }, app);
 
   // Start the in-process worker so enqueued jobs actually run.
   runtime.queue.start();
@@ -181,10 +202,11 @@ export function createApi(
     await migrateCapabilitiesSchema(runtime.db as Database);
     await migrateProvidersSchema(runtime.db as Database);
     await migrateCatalogSchema(runtime.db as Database);
+    await migratePoliciesSchema(runtime.db as Database);
     await migrateIdempotencySchema(runtime.db as Database);
   };
 
-  return { app, runtime, auth, orgs, projects, capabilities, providers, catalog, idempotency, migrate };
+  return { app, runtime, auth, orgs, projects, capabilities, providers, catalog, policies, idempotency, migrate };
 }
 
 export interface ServeOptions extends RuntimeOptions {

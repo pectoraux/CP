@@ -120,8 +120,42 @@ const PROVIDER_SDK_PACKAGES = [
 // forms are already rejected by the generic cross-module rules, which
 // take priority (at most one violation per specifier).
 const DIRECTIONAL_FORBIDDEN = new Map([
-  ["capabilities", new Set(["providers", "catalog"])],
-  ["providers", new Set(["routing", "optimization", "experiments", "catalog"])],
+  // WORK-008 §22/§25: /policies is tenant-scoped customer configuration
+  // (hard constraints + preferences). It may import @cp/platform,
+  // @cp/auth, @cp/capabilities, @cp/catalog public interfaces — but it
+  // must NEVER import the downstream decision layers (eligibility/
+  // routing/optimization/experimentation/execution/strategy) or any
+  // premature module: the policy engine expresses the RULES; those
+  // layers consume the evaluation results (WORK-009+).
+  [
+    "policies",
+    new Set([
+      "eligibility",
+      "routing",
+      "optimization",
+      "experiments",
+      "executions",
+      "plans",
+      "strategies",
+      "observations",
+      "outcomes",
+      "evidence",
+      "connections",
+      "resources",
+      "providers",
+      "webhooks",
+      "events",
+      "audit",
+      "llm",
+      "agents",
+      "goals",
+    ]),
+  ],
+  // Upstream modules must not import /policies (no cycles): capability
+  // semantics, provider identity, and catalog facts are upstream of
+  // tenant policy configuration.
+  ["capabilities", new Set(["providers", "catalog", "policies"])],
+  ["providers", new Set(["routing", "optimization", "experiments", "catalog", "policies"])],
   // WORK-007 §22: /catalog is the normalized marketplace PROJECTION — it
   // consumes capabilities + providers public interfaces and owns only
   // marketplace facts. It must never import the downstream decision
