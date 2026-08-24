@@ -120,8 +120,39 @@ const PROVIDER_SDK_PACKAGES = [
 // forms are already rejected by the generic cross-module rules, which
 // take priority (at most one violation per specifier).
 const DIRECTIONAL_FORBIDDEN = new Map([
-  ["capabilities", new Set(["providers"])],
-  ["providers", new Set(["routing", "optimization", "experiments"])],
+  ["capabilities", new Set(["providers", "catalog"])],
+  ["providers", new Set(["routing", "optimization", "experiments", "catalog"])],
+  // WORK-007 §22: /catalog is the normalized marketplace PROJECTION — it
+  // consumes capabilities + providers public interfaces and owns only
+  // marketplace facts. It must never import the downstream decision
+  // layers (policy/eligibility/plans/strategies/routing/execution/
+  // optimization/experimentation) or the future observation/evidence/
+  // connection/resource modules: the catalog stores normalized facts;
+  // those layers consume them.
+  [
+    "catalog",
+    new Set([
+      "routing",
+      "optimization",
+      "experiments",
+      "eligibility",
+      "policies",
+      "plans",
+      "strategies",
+      "executions",
+      "observations",
+      "outcomes",
+      "evidence",
+      "connections",
+      "resources",
+      "webhooks",
+      "events",
+      "audit",
+      "llm",
+      "agents",
+      "goals",
+    ]),
+  ],
 ]);
 
 /**
