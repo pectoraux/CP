@@ -32,6 +32,7 @@ import {
   migrateProvidersSchema,
   createDefaultAdapterRegistry,
 } from "@cp/providers";
+import { CatalogService, migrateCatalogSchema } from "@cp/catalog";
 import {
   correlationMiddleware,
   errorMiddleware,
@@ -43,6 +44,7 @@ import { createAuthRoutes } from "./handlers-auth.ts";
 import { createProjectRoutes } from "./handlers-projects.ts";
 import { createCapabilityRoutes } from "./handlers-capabilities.ts";
 import { createProviderRoutes } from "./handlers-providers.ts";
+import { createCatalogRoutes } from "./handlers-catalog.ts";
 import {
   IdempotencyStore,
   migrateIdempotencySchema,
@@ -56,18 +58,20 @@ export interface Api {
   projects: ProjectsService;
   capabilities: CapabilitiesService;
   providers: ProvidersService;
+  catalog: CatalogService;
   idempotency: IdempotencyStore;
   /**
    * Create or update the /auth + /organizations + /projects + capabilities
-   * + providers + idempotency schema on the configured database.
+   * + providers + catalog + idempotency schema on the configured database.
    * Idempotent. Safe to call on every startup. Must be called before
-   * auth/org/project/capability/provider routes will function. Throws on
-   * DB failure so misconfiguration is explicit (no silent no-schema
-   * fallback) — the serve() readiness gate refuses to bind the HTTP
-   * listener if this fails.
+   * auth/org/project/capability/provider/catalog routes will function.
+   * Throws on DB failure so misconfiguration is explicit (no silent
+   * no-schema fallback) — the serve() readiness gate refuses to bind the
+   * HTTP listener if this fails.
    *
-   * Ordering: the /providers migration references cp_capabilities
-   * (cross-module FK), so it runs AFTER the /capabilities migration.
+   * Ordering: the /providers migration references cp_capabilities and the
+   * /catalog migration references cp_provider_capabilities (cross-module
+   * FKs), so they run AFTER capabilities and providers respectively.
    */
   migrate(): Promise<void>;
 }
@@ -116,6 +120,17 @@ export function createApi(
     capabilities,
     adapters: createDefaultAdapterRegistry(),
   });
+  // WORK-007: the marketplace catalog consumes the capability catalog's
+  // public interface for the admin-authority check and projects offerings
+  // over the providers/capabilities tables via SQL joins (catalog →
+  // capabilities/providers is the intended one-way direction; the catalog
+  // owns only marketplace FACTS — pricing, coverage, health — with
+  // provenance).
+  const catalog = new CatalogService({
+    db: runtime.db,
+    logger: runtime.logger,
+    capabilities,
+  });
   const idempotency = new IdempotencyStore({
     db: runtime.db,
     logger: runtime.logger,
@@ -148,6 +163,13 @@ export function createApi(
   // tenant connection data and NO secrets (credential REQUIREMENTS are
   // metadata only; actual secrets belong to the future connections layer).
   createProviderRoutes({ runtime, auth, orgs, providers, idempotency }, app);
+  // WORK-007 catalog routes under /v1/catalog — the read-oriented
+  // marketplace query surface (offering list/detail with filters) plus
+  // admin-gated fact mutations (pricing/coverage/health). The catalog is
+  // GLOBAL: no tenant connection data and no secrets on any route; reads
+  // are authenticated-only and mutations require the CP-level
+  // capability-admin grant (checked inside CatalogService).
+  createCatalogRoutes({ runtime, auth, orgs, catalog, idempotency }, app);
 
   // Start the in-process worker so enqueued jobs actually run.
   runtime.queue.start();
@@ -158,10 +180,11 @@ export function createApi(
     await migrateProjectsSchema(runtime.db as Database);
     await migrateCapabilitiesSchema(runtime.db as Database);
     await migrateProvidersSchema(runtime.db as Database);
+    await migrateCatalogSchema(runtime.db as Database);
     await migrateIdempotencySchema(runtime.db as Database);
   };
 
-  return { app, runtime, auth, orgs, projects, capabilities, providers, idempotency, migrate };
+  return { app, runtime, auth, orgs, projects, capabilities, providers, catalog, idempotency, migrate };
 }
 
 export interface ServeOptions extends RuntimeOptions {
