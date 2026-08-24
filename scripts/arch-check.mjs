@@ -16,6 +16,10 @@
 //   (3) `/platform` must not import any domain module (foundational layer).
 //   (4) `/api` (transport layer) must not import module internals — it may
 //       import only the bare public interface `@cp/<module>`.
+//   (6) Infrastructure SDKs (pg, ioredis, redis, aws4fetch, @aws-sdk/*)
+//       are isolated to /platform internals. Any other module importing
+//       them -> infra-sdk-in-non-platform. Domain modules and the API
+//       transport depend on the provider-neutral platform interfaces.
 //
 // At most one violation is emitted per specifier (most specific rule wins)
 // so the failure surface stays legible and synthetic tests can assert exact
@@ -70,6 +74,20 @@ const TRANSPORT_LAYERS = ["api", "main"];
 // `platform` is the foundation; it may not import any other module
 // (domain modules per lock §8, and the api transport by layering).
 const PLATFORM = "platform";
+
+// Infrastructure SDK packages that must NEVER leak outside /platform
+// internals (architecture §2.3, §26, lock §8, §12). Domain modules and
+// the API transport depend on the provider-neutral platform interfaces
+// (Database / JobQueue / ObjectStorage / Cache / Lock), never on the
+// concrete PostgreSQL/Redis/S3 clients. Only /platform may import these.
+const INFRA_SDK_PACKAGES = [
+  "pg",
+  "ioredis",
+  "redis",
+  "aws4fetch",
+  "@aws-sdk/client-s3",
+  "@aws-sdk/s3-request-presigner",
+];
 
 /**
  * Determine the module a source file belongs to. The module is the first
@@ -267,6 +285,25 @@ function classifyViolation(c, importingModule, file, specifier) {
       rule: "no-cross-module-relative",
       message: `module "${importingModule}" imports module "${targetModule}" via relative path (${specifier}); use @cp/${targetModule} instead`,
     };
+  }
+
+  // (6) Infrastructure-SDK isolation (architecture §2.3, §26, lock §8,
+  // §12). Only /platform may import the concrete PostgreSQL/Redis/S3
+  // clients. Domain modules and the API transport depend on the
+  // provider-neutral platform interfaces instead. External bare
+  // specifiers reach here (alias/relative branches did not match).
+  if (importingModule !== PLATFORM) {
+    const pkg = specifier.startsWith("@")
+      ? specifier.split("/").slice(0, 2).join("/")
+      : specifier.split("/")[0] || "";
+    if (INFRA_SDK_PACKAGES.includes(pkg)) {
+      return {
+        file,
+        specifier,
+        rule: "infra-sdk-in-non-platform",
+        message: `module "${importingModule}" imports infrastructure SDK "${pkg}" directly; depend on @cp/platform interfaces instead (${specifier})`,
+      };
+    }
   }
 
   return null;
