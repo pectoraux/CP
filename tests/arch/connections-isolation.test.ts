@@ -1,0 +1,243 @@
+// tests/arch/connections-isolation.test.ts — WORK-010 architecture tests
+// (architecture §35, §36, lock §7, §8, WORK-010 §30). Proves:
+//   - /connections CANNOT import the downstream decision layers
+//     (routing/optimization/experiments/executions/plans/strategies/...)
+//   - /connections CAN import its legal upstream modules (platform, auth,
+//     projects, providers, capabilities, credentials)
+//   - /credentials CANNOT import ANY domain module (only @cp/platform —
+//     the secret boundary is isolated from domain concerns)
+//   - /capabilities, /providers, /catalog, /policies, /eligibility cannot
+//     import @cp/connections (no cycles); capabilities/catalog/policies/
+//     eligibility also cannot import @cp/credentials
+//   - /api uses only the public interfaces
+//   - the real trees are clean; the whole tree passes programmatically
+import { describe, expect, it } from "bun:test";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+import {
+  analyzeImports,
+  moduleOf,
+} from "../../scripts/arch-check.mjs";
+
+const ROOT = join(import.meta.dirname, "..", "..");
+const SRC = join(ROOT, "src");
+function f(rel: string): string {
+  return join(SRC, rel);
+}
+
+async function listFiles(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  const entries = await readdir(dir, { withFileTypes: true });
+  for (const e of entries) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) out.push(...(await listFiles(p)));
+    else if (e.isFile() && (e.name.endsWith(".ts") || e.name.endsWith(".mjs"))) {
+      out.push(p);
+    }
+  }
+  return out;
+}
+
+const CONNECTIONS_FORBIDDEN = [
+  "routing",
+  "optimization",
+  "experiments",
+  "executions",
+  "plans",
+  "strategies",
+  "observations",
+  "outcomes",
+  "evidence",
+  "resources",
+  "webhooks",
+  "events",
+  "audit",
+  "llm",
+  "agents",
+  "goals",
+];
+
+const CREDENTIALS_FORBIDDEN = [
+  "auth",
+  "organizations",
+  "projects",
+  "capabilities",
+  "providers",
+  "catalog",
+  "policies",
+  "eligibility",
+  "goals",
+  "plans",
+  "executions",
+  "routing",
+  "optimization",
+  "experiments",
+  "observations",
+  "outcomes",
+  "evidence",
+  "resources",
+  "connections",
+  "webhooks",
+  "events",
+  "audit",
+  "llm",
+  "agents",
+];
+
+describe("connections/credentials boundaries (synthetic detection)", () => {
+  it("rejects /connections importing every downstream module", () => {
+    for (const mod of CONNECTIONS_FORBIDDEN) {
+      const v = analyzeImports([
+        {
+          path: f("connections/internal/service.ts"),
+          content: `import { X } from "@cp/${mod}";`,
+        },
+      ]);
+      expect(v.length, `@cp/${mod} from /connections must be rejected`).toBe(1);
+      expect(v[0]!.rule).toBe("connections-forbidden-import");
+      expect(v[0]!.message).toContain(`must not import module "${mod}"`);
+    }
+  });
+
+  it("rejects /credentials importing ANY domain module (platform-only boundary)", () => {
+    for (const mod of CREDENTIALS_FORBIDDEN) {
+      const v = analyzeImports([
+        {
+          path: f("credentials/internal/service.ts"),
+          content: `import { X } from "@cp/${mod}";`,
+        },
+      ]);
+      expect(v.length, `@cp/${mod} from /credentials must be rejected`).toBe(1);
+      expect(v[0]!.rule).toBe("credentials-forbidden-import");
+      expect(v[0]!.message).toContain(`must not import module "${mod}"`);
+    }
+    // @cp/platform itself remains legal.
+    const ok = analyzeImports([
+      {
+        path: f("credentials/internal/service.ts"),
+        content: `import { AppError } from "@cp/platform";`,
+      },
+    ]);
+    expect(ok).toEqual([]);
+  });
+
+  it("allows /connections importing its legal upstream modules", () => {
+    const v = analyzeImports([
+      {
+        path: f("connections/internal/service.ts"),
+        content: `import { AppError } from "@cp/platform";\nimport type { Principal } from "@cp/auth";\nimport type { ProjectsService } from "@cp/projects";\nimport type { ProvidersService } from "@cp/providers";\nimport type { CapabilitiesService } from "@cp/capabilities";\nimport type { CredentialsService } from "@cp/credentials";`,
+      },
+    ]);
+    expect(v).toEqual([]);
+  });
+
+  it("rejects upstream modules importing @cp/connections and @cp/credentials", () => {
+    for (const mod of ["capabilities", "providers", "catalog", "policies", "eligibility"]) {
+      const v = analyzeImports([
+        {
+          path: f(`${mod}/internal/x.ts`),
+          content: `import { ConnectionsService } from "@cp/connections";`,
+        },
+      ]);
+      expect(v.length, `@cp/connections from /${mod} must be rejected`).toBe(1);
+      expect(v[0]!.rule).toBe(`${mod}-forbidden-import`);
+      expect(v[0]!.message).toContain('must not import module "connections"');
+    }
+    for (const mod of ["capabilities", "catalog", "policies", "eligibility"]) {
+      const v = analyzeImports([
+        {
+          path: f(`${mod}/internal/x.ts`),
+          content: `import { CredentialsService } from "@cp/credentials";`,
+        },
+      ]);
+      expect(v.length, `@cp/credentials from /${mod} must be rejected`).toBe(1);
+      expect(v[0]!.rule).toBe(`${mod}-forbidden-import`);
+      expect(v[0]!.message).toContain('must not import module "credentials"');
+    }
+  });
+
+  it("rejects /api importing @cp/connections/internal/* or @cp/credentials/internal/*", () => {
+    for (const mod of ["connections", "credentials"]) {
+      const v = analyzeImports([
+        {
+          path: f("api/internal/handlers-connections.ts"),
+          content: `import { x } from "@cp/${mod}/internal/service.ts";`,
+        },
+      ]);
+      expect(v.length).toBe(1);
+      expect(v[0]!.rule).toBe("api-no-module-internals");
+    }
+  });
+
+  it("moduleOf classifies the new module paths correctly", () => {
+    expect(moduleOf(f("connections/index.ts"))).toBe("connections");
+    expect(moduleOf(f("connections/internal/service.ts"))).toBe("connections");
+    expect(moduleOf(f("credentials/internal/service.ts"))).toBe("credentials");
+    expect(moduleOf(f("credentials/internal/crypto.ts"))).toBe("credentials");
+  });
+});
+
+describe("connections/credentials boundaries (real source tree)", () => {
+  it("the real /connections tree imports only legal modules (platform, auth, projects, providers, capabilities, credentials)", async () => {
+    const files = await listFiles(f("connections"));
+    expect(files.length).toBeGreaterThan(0);
+    const ALLOWED = new Set(["platform", "auth", "projects", "providers", "capabilities", "credentials"]);
+    const PKG_RE = /^[a-zA-Z@][a-zA-Z0-9@/._-]*$/;
+    for (const file of files) {
+      const content = await readFile(file, "utf8");
+      const specifiers = [...content.matchAll(/(?:from\s*|import\s*\()\s*['"]([^'"]+)['"]/g)]
+        .map((m) => m[1]!)
+        .filter((s) => PKG_RE.test(s));
+      for (const s of specifiers) {
+        if (s.startsWith("@cp/")) {
+          const mod = s.slice("@cp/".length).split("/")[0]!;
+          expect(s === `@cp/${mod}`, `${file} must use the bare public alias`).toBe(true);
+          expect(
+            ALLOWED.has(mod),
+            `${file} imports @cp/${mod} which is not in the WORK-010 connections dependency set`,
+          ).toBe(true);
+        } else if (!s.startsWith(".") && !s.startsWith("node:") && !s.startsWith("bun")) {
+          expect(false, `${file} imports external package "${s}"`).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("the real /credentials tree imports ONLY @cp/platform + node builtins (isolated secret boundary)", async () => {
+    const files = await listFiles(f("credentials"));
+    expect(files.length).toBeGreaterThan(0);
+    const PKG_RE = /^[a-zA-Z@][a-zA-Z0-9@/._-]*$/;
+    for (const file of files) {
+      const content = await readFile(file, "utf8");
+      const specifiers = [...content.matchAll(/(?:from\s*|import\s*\()\s*['"]([^'"]+)['"]/g)]
+        .map((m) => m[1]!)
+        .filter((s) => PKG_RE.test(s));
+      for (const s of specifiers) {
+        if (s.startsWith("@cp/")) {
+          expect(s === "@cp/platform", `${file} may import ONLY @cp/platform (got ${s})`).toBe(true);
+        } else if (!s.startsWith(".") && !s.startsWith("node:") && !s.startsWith("bun")) {
+          expect(false, `${file} imports external package "${s}"`).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("NO-SECRET-IN-CODE: /connections source never handles secret values (only opaque references)", async () => {
+    const files = await listFiles(f("connections"));
+    for (const file of files) {
+      const content = await readFile(file, "utf8");
+      expect(content.includes("secret_value"), `${file} must not reference secret_value`).toBe(false);
+      expect(content.includes("encryptSecret"), `${file} must not encrypt/decrypt secrets`).toBe(false);
+      expect(content.includes("decryptSecret"), `${file} must not encrypt/decrypt secrets`).toBe(false);
+    }
+  });
+
+  it("the whole tree passes arch:check with the new rules (invoked programmatically)", async () => {
+    const files = await listFiles(SRC);
+    const inputs = await Promise.all(
+      files.map(async (p) => ({ path: p, content: await readFile(p, "utf8") })),
+    );
+    const v = analyzeImports(inputs);
+    expect(v).toEqual([]);
+  });
+});

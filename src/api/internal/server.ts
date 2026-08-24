@@ -35,6 +35,8 @@ import {
 import { CatalogService, migrateCatalogSchema } from "@cp/catalog";
 import { PoliciesService, migratePoliciesSchema } from "@cp/policies";
 import { EligibilityService } from "@cp/eligibility";
+import { CredentialsService, migrateCredentialsSchema } from "@cp/credentials";
+import { ConnectionsService, migrateConnectionsSchema } from "@cp/connections";
 import {
   correlationMiddleware,
   errorMiddleware,
@@ -49,6 +51,7 @@ import { createProviderRoutes } from "./handlers-providers.ts";
 import { createCatalogRoutes } from "./handlers-catalog.ts";
 import { createPolicyRoutes } from "./handlers-policies.ts";
 import { createEligibilityRoutes } from "./handlers-eligibility.ts";
+import { createConnectionRoutes } from "./handlers-connections.ts";
 import {
   IdempotencyStore,
   migrateIdempotencySchema,
@@ -65,6 +68,8 @@ export interface Api {
   catalog: CatalogService;
   policies: PoliciesService;
   eligibility: EligibilityService;
+  credentials: CredentialsService;
+  connections: ConnectionsService;
   idempotency: IdempotencyStore;
   /**
    * Create or update the /auth + /organizations + /projects + capabilities
@@ -161,6 +166,27 @@ export function createApi(
     policies,
     projects,
   });
+  // WORK-010: the credential boundary owns secret material (encrypted
+  // AES-256-GCM blobs in the platform ObjectStorage; metadata in
+  // PostgreSQL). The master key comes from deployment configuration
+  // (CP_CREDENTIAL_MASTER_KEY) — never persisted, never logged.
+  const credentials = new CredentialsService({
+    db: runtime.db,
+    storage: runtime.storage,
+    logger: runtime.logger,
+  });
+  // WORK-010: the tenant-scoped connection layer references global
+  // providers/capabilities (public interfaces) and credential references
+  // (never secrets). It is downstream tenant infrastructure: connection
+  // existence never mutates catalog/eligibility state.
+  const connections = new ConnectionsService({
+    db: runtime.db,
+    logger: runtime.logger,
+    projects,
+    capabilities,
+    providers,
+    credentials,
+  });
   const idempotency = new IdempotencyStore({
     db: runtime.db,
     logger: runtime.logger,
@@ -214,6 +240,13 @@ export function createApi(
   // membership and loads the policy ONLY within the authorized project
   // scope. Evaluation is read-only, explainable, and produces NO ranking.
   createEligibilityRoutes({ runtime, auth, orgs, projects, eligibility, idempotency }, app);
+  // WORK-010 connection routes under the project scope
+  // (/v1/organizations/:orgId/projects/:projectId/connections). The
+  // standard WORK-004 tenant gates run first; the service re-verifies
+  // membership + admin/owner role for mutations. The credential-attach
+  // endpoint is the ONLY secret-bearing route and uses redacted-fingerprint
+  // idempotency so raw secrets never reach cp_idempotency.
+  createConnectionRoutes({ runtime, auth, orgs, projects, connections, idempotency }, app);
 
   // Start the in-process worker so enqueued jobs actually run.
   runtime.queue.start();
@@ -226,10 +259,12 @@ export function createApi(
     await migrateProvidersSchema(runtime.db as Database);
     await migrateCatalogSchema(runtime.db as Database);
     await migratePoliciesSchema(runtime.db as Database);
+    await migrateCredentialsSchema(runtime.db as Database);
+    await migrateConnectionsSchema(runtime.db as Database);
     await migrateIdempotencySchema(runtime.db as Database);
   };
 
-  return { app, runtime, auth, orgs, projects, capabilities, providers, catalog, policies, eligibility, idempotency, migrate };
+  return { app, runtime, auth, orgs, projects, capabilities, providers, catalog, policies, eligibility, credentials, connections, idempotency, migrate };
 }
 
 export interface ServeOptions extends RuntimeOptions {

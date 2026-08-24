@@ -141,6 +141,7 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "outcomes",
       "evidence",
       "connections",
+      "credentials",
       "resources",
       "providers",
       "webhooks",
@@ -170,6 +171,7 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "outcomes",
       "evidence",
       "connections",
+      "credentials",
       "resources",
       "webhooks",
       "events",
@@ -179,11 +181,95 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "goals",
     ]),
   ],
+  // WORK-010 §30: /connections is the tenant-scoped connection layer —
+  // downstream infrastructure for tenant access. It consumes the
+  // providers/catalog/projects/auth/credentials public interfaces but
+  // must NEVER import the downstream decision layers or premature
+  // modules.
+  [
+    "connections",
+    new Set([
+      "routing",
+      "optimization",
+      "experiments",
+      "executions",
+      "plans",
+      "strategies",
+      "observations",
+      "outcomes",
+      "evidence",
+      "resources",
+      "webhooks",
+      "events",
+      "audit",
+      "llm",
+      "agents",
+      "goals",
+    ]),
+  ],
+  // WORK-010 §26, §30-§31: /credentials is THE secret boundary — it may
+  // import ONLY @cp/platform (+ node builtins). It must never depend on
+  // any domain module: secret access policy stays isolated from domain
+  // concerns, and no domain import can leak into secret handling.
+  [
+    "credentials",
+    new Set([
+      "auth",
+      "organizations",
+      "projects",
+      "capabilities",
+      "providers",
+      "catalog",
+      "policies",
+      "eligibility",
+      "goals",
+      "plans",
+      "executions",
+      "routing",
+      "optimization",
+      "experiments",
+      "observations",
+      "outcomes",
+      "evidence",
+      "resources",
+      "connections",
+      "webhooks",
+      "events",
+      "audit",
+      "llm",
+      "agents",
+    ]),
+  ],
   // Upstream modules must not import /policies or /eligibility (no
   // cycles): capability semantics, provider identity, catalog facts,
-  // and policy rules are upstream of candidate evaluation.
-  ["capabilities", new Set(["providers", "catalog", "policies", "eligibility"])],
-  ["providers", new Set(["routing", "optimization", "experiments", "catalog", "policies", "eligibility"])],
+  // and policy rules are upstream of candidate evaluation. WORK-010
+  // extends this with /connections (tenant-scoped downstream
+  // infrastructure) and /credentials (the secret boundary — policy,
+  // catalog, eligibility, and capabilities never need secret access:
+  // WORK-010 §38 final authority rule).
+  [
+    "capabilities",
+    new Set([
+      "providers",
+      "catalog",
+      "policies",
+      "eligibility",
+      "connections",
+      "credentials",
+    ]),
+  ],
+  [
+    "providers",
+    new Set([
+      "routing",
+      "optimization",
+      "experiments",
+      "catalog",
+      "policies",
+      "eligibility",
+      "connections",
+    ]),
+  ],
   // WORK-007 §22: /catalog is the normalized marketplace PROJECTION — it
   // consumes capabilities + providers public interfaces and owns only
   // marketplace facts. It must never import the downstream decision
@@ -199,6 +285,7 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "experiments",
       "eligibility",
       "policies",
+      "credentials",
       "plans",
       "strategies",
       "executions",
