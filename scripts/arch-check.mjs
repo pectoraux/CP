@@ -89,6 +89,41 @@ const INFRA_SDK_PACKAGES = [
   "@aws-sdk/s3-request-presigner",
 ];
 
+// Provider SDK packages (architecture-lock §7: "Provider-specific SDKs
+// are allowed only inside provider adapters. Domain modules must not
+// import provider SDKs directly."). These may be imported ONLY from
+// files under src/providers/internal/adapters/* — the adapter internals.
+// None of these are currently dependencies (WORK-006 ships a deterministic
+// fixture adapter with no external SDK); the rule is preventive so a
+// future adapter SDK can never leak into domain modules or registry code.
+const PROVIDER_SDK_PACKAGES = [
+  "stripe",
+  "openai",
+  "@anthropic-ai/sdk",
+  "twilio",
+  "plaid",
+  "@adyen/api-library",
+  "paystack",
+  "googleapis",
+  "axios",
+];
+
+// Directional (one-way) module rules (WORK-006 §20):
+//   - /capabilities must NOT import /providers: the capability layer is
+//     UPSTREAM of providers (the capability graph is the semantic
+//     foundation; provider-specific knowledge is downstream).
+//   - /providers must NOT import /routing, /optimization, /experiments:
+//     routing/execution/optimization belong to later work; the provider
+//     layer stays subordinate to the capability contract and contains no
+//     provider-selection logic.
+// Both rules apply to the BARE alias form only — deep/internal/relative
+// forms are already rejected by the generic cross-module rules, which
+// take priority (at most one violation per specifier).
+const DIRECTIONAL_FORBIDDEN = new Map([
+  ["capabilities", new Set(["providers"])],
+  ["providers", new Set(["routing", "optimization", "experiments"])],
+]);
+
 /**
  * Determine the module a source file belongs to. The module is the first
  * path segment under src/ (e.g. src/platform/internal/ids.ts → "platform";
@@ -230,6 +265,19 @@ function classifyViolation(c, importingModule, file, specifier) {
         message: `module "${importingModule}" imports deep path of module "${targetModule}" (${specifier}); use @cp/${targetModule} instead`,
       };
     }
+    // (5) directional one-way rules (WORK-006 §20) — apply to the BARE
+    // alias form, which is otherwise the canonical legal import. Deep /
+    // internal / relative forms were already rejected above by the more
+    // specific generic rules (priority chain preserved).
+    const forbiddenTargets = DIRECTIONAL_FORBIDDEN.get(importingModule);
+    if (forbiddenTargets && forbiddenTargets.has(targetModule)) {
+      return {
+        file,
+        specifier,
+        rule: `${importingModule}-forbidden-import`,
+        message: `module "${importingModule}" must not import module "${targetModule}" (one-way dependency rule; ${specifier})`,
+      };
+    }
     // bare @cp/<module> — the canonical legal cross-module form.
     return null;
   }
@@ -303,6 +351,28 @@ function classifyViolation(c, importingModule, file, specifier) {
         rule: "infra-sdk-in-non-platform",
         message: `module "${importingModule}" imports infrastructure SDK "${pkg}" directly; depend on @cp/platform interfaces instead (${specifier})`,
       };
+    }
+    // (7) Provider-SDK isolation (architecture-lock §7, WORK-006 §20):
+    // provider SDKs are allowed ONLY inside provider adapter internals
+    // (src/providers/internal/adapters/*). Domain modules must never
+    // import them; /providers registry/contract code must not either —
+    // only the adapter files may.
+    if (PROVIDER_SDK_PACKAGES.includes(pkg)) {
+      const inAdapterInternals =
+        importingModule === "providers" &&
+        file.replace(/\\/g, "/").includes("/providers/internal/adapters/");
+      if (!inAdapterInternals) {
+        return {
+          file,
+          specifier,
+          rule: "provider-sdk-isolation",
+          message:
+            importingModule === "providers"
+              ? `provider SDK "${pkg}" may only be imported inside src/providers/internal/adapters/* (${specifier})`
+              : `module "${importingModule}" must not import provider SDK "${pkg}" directly; provider SDKs live only inside provider adapter internals (${specifier})`,
+        };
+      }
+      return null;
     }
   }
 
