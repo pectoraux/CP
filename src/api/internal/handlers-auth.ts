@@ -32,6 +32,7 @@ import {
   requirePrincipal,
   type AuthVars,
 } from "./middleware.ts";
+import { IdempotencyStore, withIdempotency } from "./idempotency.ts";
 
 // Default session-token lifetime (POST /v1/auth/sessions). 12 hours —
 // short enough to bound replay risk, long enough to be usable.
@@ -41,6 +42,7 @@ export interface AuthRouteDeps {
   runtime: Runtime;
   auth: AuthService;
   orgs: OrganizationsService;
+  idempotency: IdempotencyStore;
 }
 
 /**
@@ -59,7 +61,7 @@ export function createAuthRoutes(
   deps: AuthRouteDeps,
   app: Hono<{ Variables: AuthVars }>,
 ): void {
-  const { runtime, auth, orgs } = deps;
+  const { runtime, auth, orgs, idempotency } = deps;
   // Verify credential IF present on every auth/org route.
   app.use("/v1/auth/*", authMiddleware(runtime, auth, orgs));
   app.use("/v1/organizations/*", authMiddleware(runtime, auth, orgs));
@@ -221,36 +223,42 @@ export function createAuthRoutes(
 
   app.post("/v1/organizations", requirePrincipal(), async (c) => {
     const principal = c.get("principal")!;
-    const body = await readJsonBody(c);
-    const name = String(body?.name ?? "").trim();
-    const slug = String(body?.slug ?? "").trim();
-    if (!name || !slug) {
+    // Opt-in idempotency (WORK-004 API-002). Without an Idempotency-Key
+    // header this is a no-op pass-through to the handler; with one, the
+    // (key, user) → response mapping is recorded so a safe retry returns
+    // the same org rather than creating a duplicate.
+    return withIdempotency(c, idempotency, principal, async (body) => {
+      const name = String(body?.name ?? "").trim();
+      const slug = String(body?.slug ?? "").trim();
+      if (!name || !slug) {
+        return c.json(
+          {
+            error: {
+              category: "POLICY_BLOCKED",
+              code: "organization.validation",
+              message: "name and slug are required",
+              retryable: false,
+              request_id: c.get("requestId"),
+            },
+          },
+          400,
+        );
+      }
+      // createOrganizationWithOwner is transactional: org + initial owner
+      // membership commit atomically. The caller becomes the owner.
+      const { organization, ownerMembership } = await orgs.createOrganizationWithOwner({
+        ownerUserId: principal.userId,
+        name,
+        slug,
+      });
       return c.json(
         {
-          error: {
-            category: "POLICY_BLOCKED",
-            code: "organization.validation",
-            message: "name and slug are required",
-            retryable: false,
-          },
+          organization: serializeOrganization(organization),
+          owner_membership: serializeMembership(ownerMembership),
         },
-        400,
+        201,
       );
-    }
-    // createOrganizationWithOwner is transactional: org + initial owner
-    // membership commit atomically. The caller becomes the owner.
-    const { organization, ownerMembership } = await orgs.createOrganizationWithOwner({
-      ownerUserId: principal.userId,
-      name,
-      slug,
     });
-    return c.json(
-      {
-        organization: serializeOrganization(organization),
-        owner_membership: serializeMembership(ownerMembership),
-      },
-      201,
-    );
   });
 
   app.get("/v1/organizations", requirePrincipal(), async (c) => {

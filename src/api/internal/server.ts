@@ -2,12 +2,13 @@
 // Transport-boundary composition. Builds a Hono application wired with the
 // error + correlation middleware (WORK-001), the WORK-003 auth middleware,
 // the platform demo routes (WORK-001), and the auth + organizations
-// routes (WORK-003). Provides a `serve()` helper that runs a Bun HTTP
-// server and a `migrate()` method that provisions the auth + org schema.
+// routes (WORK-003) + project routes (WORK-004). Provides a `serve()`
+// helper that runs a Bun HTTP server and a `migrate()` method that
+// provisions the auth + org + projects + idempotency schema.
 //
 // The API layer is a transport boundary only (architecture §35, lock §8):
-// it imports only the PUBLIC interfaces of /platform, /auth, and
-// /organizations — never any module's `internal/`.
+// it imports only the PUBLIC interfaces of /platform, /auth, /organizations,
+// and /projects — never any module's `internal/`.
 
 import { Hono } from "hono";
 import {
@@ -21,6 +22,7 @@ import {
   OrganizationsService,
   migrateOrganizationsSchema,
 } from "@cp/organizations";
+import { ProjectsService, migrateProjectsSchema } from "@cp/projects";
 import {
   correlationMiddleware,
   errorMiddleware,
@@ -29,17 +31,26 @@ import {
 } from "./middleware.ts";
 import { createPlatformRoutes } from "./handlers.ts";
 import { createAuthRoutes } from "./handlers-auth.ts";
+import { createProjectRoutes } from "./handlers-projects.ts";
+import {
+  IdempotencyStore,
+  migrateIdempotencySchema,
+} from "./idempotency.ts";
 
 export interface Api {
   app: Hono<{ Variables: AuthVars }>;
   runtime: Runtime;
   auth: AuthService;
   orgs: OrganizationsService;
+  projects: ProjectsService;
+  idempotency: IdempotencyStore;
   /**
-   * Create or update the /auth + /organizations schema on the configured
-   * database. Idempotent. Safe to call on every startup. Must be called
-   * before auth/org routes will function. Throws on DB failure so
-   * misconfiguration is explicit (no silent no-auth fallback).
+   * Create or update the /auth + /organizations + /projects + idempotency
+   * schema on the configured database. Idempotent. Safe to call on every
+   * startup. Must be called before auth/org/project routes will function.
+   * Throws on DB failure so misconfiguration is explicit (no silent
+   * no-schema fallback) — the serve() readiness gate refuses to bind the
+   * HTTP listener if this fails.
    */
   migrate(): Promise<void>;
 }
@@ -57,14 +68,22 @@ export function createApi(
   app.use("*", errorMiddleware());
   app.use("*", correlationMiddleware(runtime));
 
-  // Construct the /auth and /organizations services from the runtime's
-  // database. If the database is the unconfigured sentinel, the services
-  // are still constructed (cheap) but their routes will throw
-  // PLATFORM_FAILURE on use — the explicit failure mode when no DB is
-  // configured. This keeps the transport boundary honest: there is no
-  // silent fallback to an in-memory auth store.
+  // Construct the /auth, /organizations, /projects services and the
+  // idempotency store from the runtime's database. If the database is the
+  // unconfigured sentinel, the services are still constructed (cheap) but
+  // their routes will throw PLATFORM_FAILURE on use — the explicit failure
+  // mode when no DB is configured. There is no silent fallback to an
+  // in-memory store.
   const auth = new AuthService({ db: runtime.db, logger: runtime.logger });
   const orgs = new OrganizationsService({
+    db: runtime.db,
+    logger: runtime.logger,
+  });
+  const projects = new ProjectsService({
+    db: runtime.db,
+    logger: runtime.logger,
+  });
+  const idempotency = new IdempotencyStore({
     db: runtime.db,
     logger: runtime.logger,
   });
@@ -74,8 +93,14 @@ export function createApi(
   // WORK-003 auth + organizations routes. createAuthRoutes registers the
   // auth middleware + routes directly on the main app so errors thrown by
   // orgContextMiddleware or the service propagate up through errorMiddleware
-  // (registered above) and become structured JSON responses.
-  createAuthRoutes({ runtime, auth, orgs }, app);
+  // (registered above) and become structured JSON responses. The
+  // idempotency store is passed so POST /v1/organizations supports
+  // Idempotency-Key (WORK-004 API-002).
+  createAuthRoutes({ runtime, auth, orgs, idempotency }, app);
+  // WORK-004 project routes under /v1/organizations/:orgId/projects. The
+  // org-level gate (orgContextMiddleware) runs first; the project-level
+  // gate (projectContextMiddleware) runs for :projectId routes.
+  createProjectRoutes({ runtime, orgs, projects, idempotency }, app);
 
   // Start the in-process worker so enqueued jobs actually run.
   runtime.queue.start();
@@ -83,18 +108,20 @@ export function createApi(
   const migrate = async (): Promise<void> => {
     await migrateAuthSchema(runtime.db as Database);
     await migrateOrganizationsSchema(runtime.db as Database);
+    await migrateProjectsSchema(runtime.db as Database);
+    await migrateIdempotencySchema(runtime.db as Database);
   };
 
-  return { app, runtime, auth, orgs, migrate };
+  return { app, runtime, auth, orgs, projects, idempotency, migrate };
 }
 
 export interface ServeOptions extends RuntimeOptions {
   port: number;
   hostname?: string;
   /**
-   * When true, run the /auth + /organizations schema migrations before
-   * binding the HTTP listener. This enforces the required startup/
-   * readiness order (architect review of WORK-003):
+   * When true, run the /auth + /organizations + /projects + idempotency
+   * schema migrations before binding the HTTP listener. This enforces the
+   * required startup/readiness order (architect review of WORK-003):
    *
    *   config -> infrastructure -> migrations -> migration success?
    *                                               |- no  -> startup failure / no readiness
