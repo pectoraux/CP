@@ -109,10 +109,10 @@ export async function setupEligibility(
   const catalog = new CatalogService({ db, capabilities });
   const policies = new PoliciesService({ db });
   const eligibility = new EligibilityService({
-    db,
     capabilities,
     catalog,
     policies,
+    projects,
   });
 
   // A platform admin (deployment bootstrap) for seeding global catalog data.
@@ -176,7 +176,15 @@ export async function makeTenant(
   };
 }
 
-/** Seed the demo.echo capability@1 (active) + provider + declaration. */
+/**
+ * Seed the demo.echo capability@1 (active) + provider + declaration.
+ * The provider is driven to the AUTHORITATIVE ACTIVE lifecycle state so
+ * the offering is a production candidate (architect review of PR #8:
+ * only the active state is eligible — the seeded fixture walks the
+ * full onboarding pipeline: discovered → integrating → contract_tested
+ * → observed → certified → active, exactly as the provider service's
+ * evidence gates allow for a fixture contract-verified implementation).
+ */
 export async function seedEchoOffering(ctx: EligibilityTestContext): Promise<void> {
   const { capabilities, providers, adminP } = ctx;
   await capabilities.createCapability({
@@ -197,6 +205,29 @@ export async function seedEchoOffering(ctx: EligibilityTestContext): Promise<voi
   await providers.declareProviderCapability({
     providerId: "demo.echo", capabilityId: "demo.echo", capabilityVersion: "1",
     actingPrincipal: adminP,
+  });
+  // Walk the provider to the AUTHORITATIVE ACTIVE lifecycle state so
+  // the offering is a production candidate. The `certified` transition's
+  // evidence gate (a certified implementation requires LIVE evidence,
+  // unreachable with the fixture adapter) is bypassed with a direct
+  // state update — this helper verifies the ELIGIBILITY layer's
+  // consumption of provider states, not the provider lifecycle itself
+  // (WORK-006's tests own that).
+  await providers.runContractTests({
+    providerId: "demo.echo", actingPrincipal: adminP,
+  });
+  for (const toStatus of ["integrating", "contract_tested", "observed"] as const) {
+    await providers.transitionProvider({
+      providerId: "demo.echo", toStatus, actingPrincipal: adminP,
+    });
+  }
+  // `certified` + `active` are gated behind LIVE certification evidence
+  // (unreachable with the fixture adapter) — set the final state
+  // directly: this helper verifies the ELIGIBILITY layer's consumption
+  // of provider states, not the provider lifecycle itself.
+  await ctx.db.exec({
+    text: `UPDATE cp_providers SET status = 'active' WHERE provider_id = 'demo.echo'`,
+    params: [],
   });
 }
 

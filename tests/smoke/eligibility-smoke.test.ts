@@ -106,6 +106,26 @@ describe("WORK-009 real-socket eligibility smoke", () => {
           body: JSON.stringify({ capability_id: "demo.echo", capability_version: "1" }),
         });
 
+        // 3b. Walk the provider to the AUTHORITATIVE ACTIVE lifecycle
+        // state (only the active state is eligible — architect review of
+        // PR #8): fixture contract tests gate `contract_tested`; the
+        // final state's live-certification gate is fixture-unreachable,
+        // so it is set directly (the lifecycle itself is WORK-006's
+        // tested surface).
+        await req(
+          `/v1/providers/${encodeURIComponent("demo.echo")}/capabilities/${encodeURIComponent("demo.echo")}/versions/1/certification-tests`,
+          { method: "POST", headers: auth, body: JSON.stringify({}) },
+        );
+        for (const status of ["integrating", "contract_tested", "observed"]) {
+          await req(`/v1/providers/${encodeURIComponent("demo.echo")}/lifecycle`, {
+            method: "POST", headers: auth, body: JSON.stringify({ status }),
+          });
+        }
+        await db.exec({
+          text: `UPDATE cp_providers SET status = 'active' WHERE provider_id = $1`,
+          params: ["demo.echo"],
+        });
+
         // 4. Catalog facts: pricing + country coverage.
         await req("/v1/catalog/pricing", {
           method: "POST", headers: auth,

@@ -327,6 +327,27 @@ describe("EligibilityService (real PostgreSQL)", () => {
         expect(evaluation.results[0]!.status).toBe("ineligible");
         expect(evaluation.results[0]!.failures.find((c) => c.checkId === "provider.status")!.actual).toBe("revoked");
 
+        // ONBOARDING states must NOT become production candidates
+        // (architect review of PR #8): discovered / integrating /
+        // contract_tested / observed are all ineligible.
+        for (const onboarding of ["discovered", "integrating", "contract_tested", "observed"]) {
+          await ctx.db.exec({
+            text: `UPDATE cp_providers SET status = $1 WHERE provider_id = 'demo.echo'`,
+            params: [onboarding],
+          });
+          evaluation = await ctx.eligibility.evaluate({
+            organizationId: tenant.organizationId, projectId: tenant.projectId,
+            capabilityId: "demo.echo", capabilityVersion: "1",
+            policyId: policy.policyId, constraints: {},
+            actingPrincipal: tenant.memberP,
+          });
+          const r = evaluation.results[0]!;
+          expect(r.status, `onboarding ${onboarding} must be ineligible end-to-end`).toBe("ineligible");
+          const check = r.failures.find((c) => c.checkId === "provider.status")!;
+          expect(check.actual).toBe(onboarding);
+          expect(check.reason).toContain("still onboarding");
+        }
+
         // Restore active for the named-candidate cases.
         await ctx.db.exec({
           text: `UPDATE cp_providers SET status = 'active' WHERE provider_id = 'demo.echo'`,

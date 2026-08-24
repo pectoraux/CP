@@ -339,26 +339,28 @@ function checkCapabilityNotRetired(offering: CatalogOffering): EligibilityCheck 
 }
 
 /**
- * Provider lifecycle (§10): the eligible set mirrors the catalog's
- * established active-offering semantics (WORK-007 §15) — suspended,
- * deprecated, and revoked providers are never eligible; revoked can
- * NEVER be eligible. Pre-active pipeline states (discovered,
- * integrating, contract_tested, observed) remain eligible here and are
- * gated instead by certification/policy checks (quality gates belong to
- * those checks, not to lifecycle).
+ * Provider lifecycle (§10; architect review of PR #8): eligibility must
+ * not turn an ONBOARDING-state provider into a production candidate —
+ * ONLY the authoritative `active` lifecycle state is eligible (subject
+ * to the other checks). Pre-active pipeline states (discovered,
+ * integrating, contract_tested, observed), suspended, deprecated, and
+ * revoked all FAIL: the marketplace's production surface is the ACTIVE
+ * provider set. Revoked can NEVER be eligible. The check never mutates
+ * provider state.
  */
-const INELIGIBLE_PROVIDER_STATUSES = new Set(["suspended", "deprecated", "revoked"]);
-
 function checkProviderStatus(offering: CatalogOffering): EligibilityCheck {
   const status = offering.provider.status;
-  if (INELIGIBLE_PROVIDER_STATUSES.has(status)) {
+  if (status !== "active") {
     return {
       checkId: "provider.status",
       category: "provider",
       result: "fail",
-      expected: "provider in an eligible lifecycle state (not suspended/deprecated/revoked)",
+      expected: "provider in the active lifecycle state",
       actual: status,
-      reason: `provider is ${status}`,
+      reason:
+        status === "discovered" || status === "integrating" || status === "contract_tested" || status === "observed"
+          ? `provider is still onboarding (${status}) — only the active lifecycle state is eligible`
+          : `provider is ${status}`,
       evidence: null,
     };
   }
@@ -366,9 +368,9 @@ function checkProviderStatus(offering: CatalogOffering): EligibilityCheck {
     checkId: "provider.status",
     category: "provider",
     result: "pass",
-    expected: "provider in an eligible lifecycle state",
+    expected: "provider in the active lifecycle state",
     actual: status,
-    reason: `provider is ${status}`,
+    reason: "provider is active",
     evidence: null,
   };
 }

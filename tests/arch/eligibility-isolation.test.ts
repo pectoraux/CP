@@ -78,11 +78,11 @@ describe("eligibility boundary (synthetic detection)", () => {
     }
   });
 
-  it("allows /eligibility importing its legal upstream modules (platform, auth, capabilities, catalog, policies, providers)", () => {
+  it("allows /eligibility importing its legal upstream modules (platform, auth, capabilities, catalog, policies, projects, providers)", () => {
     const v = analyzeImports([
       {
         path: f("eligibility/internal/service.ts"),
-        content: `import { AppError } from "@cp/platform";\nimport type { Principal } from "@cp/auth";\nimport type { CapabilitiesService } from "@cp/capabilities";\nimport type { CatalogService } from "@cp/catalog";\nimport type { PoliciesService } from "@cp/policies";\nimport type { ProvidersService } from "@cp/providers";`,
+        content: `import { AppError } from "@cp/platform";\nimport type { Principal } from "@cp/auth";\nimport type { CapabilitiesService } from "@cp/capabilities";\nimport type { CatalogService } from "@cp/catalog";\nimport type { PoliciesService } from "@cp/policies";\nimport type { ProjectsService } from "@cp/projects";\nimport type { ProvidersService } from "@cp/providers";`,
       },
     ]);
     expect(v).toEqual([]);
@@ -136,7 +136,7 @@ describe("eligibility boundary (real source tree)", () => {
   it("the real /eligibility tree imports only legal modules (platform, auth, capabilities, catalog, policies; bare aliases only; no external packages)", async () => {
     const files = await listFiles(f("eligibility"));
     expect(files.length).toBeGreaterThan(0);
-    const ALLOWED = new Set(["platform", "auth", "capabilities", "catalog", "policies"]);
+    const ALLOWED = new Set(["platform", "auth", "capabilities", "catalog", "policies", "projects"]);
     const PKG_RE = /^[a-zA-Z@][a-zA-Z0-9@/._-]*$/;
     for (const file of files) {
       const content = await readFile(file, "utf8");
@@ -179,6 +179,22 @@ describe("eligibility boundary (real source tree)", () => {
       for (const s of specifiers) {
         expect(s === "@cp/providers" || s.startsWith("@cp/providers/"), `${file} must not import @cp/providers`).toBe(false);
       }
+    }
+  });
+
+  it("NO RAW TABLE SQL: /eligibility contains no SQL against any table (projects public interface only — architect review of PR #8)", async () => {
+    const files = await listFiles(f("eligibility"));
+    for (const file of files) {
+      const content = await readFile(file, "utf8");
+      // Strip comments, then assert no table SQL remains: /eligibility is
+      // a pure evaluation layer — it holds NO Database dependency at all
+      // (the projects scope check goes through the public interface).
+      const codeOnly = content
+        .replace(/\/\*[\s\S]*?\*\//g, "") // block comments
+        .replace(/^\s*\/\/.*$/gm, ""); // line comments
+      expect(codeOnly.includes("cp_projects"), `${file} must not reference the cp_projects table in code`).toBe(false);
+      expect(/FROM\s+cp_/i.test(codeOnly), `${file} must not contain raw table SQL in code`).toBe(false);
+      expect(/db\.query|db\.exec|this\.db/i.test(codeOnly), `${file} must not hold or use a Database handle`).toBe(false);
     }
   });
 

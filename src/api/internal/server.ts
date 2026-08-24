@@ -148,16 +148,18 @@ export function createApi(
     logger: runtime.logger,
   });
   // WORK-009: the eligibility engine consumes the PUBLIC policy
-  // evaluator, the PUBLIC catalog offering projection, and the PUBLIC
-  // capabilities interface (the intended one-way direction). It is
-  // STATELESS (no tables, no cache) and its core evaluator is pure —
-  // it never invokes provider adapters or chooses winners.
+  // evaluator, the PUBLIC catalog offering projection, the PUBLIC
+  // capabilities interface, and the PUBLIC projects interface (project
+  // existence/tenant ownership — architect review of PR #8). It is
+  // STATELESS (no tables, no cache, no direct Database dependency) and
+  // its core evaluator is pure — it never invokes provider adapters or
+  // chooses winners.
   const eligibility = new EligibilityService({
-    db: runtime.db,
     logger: runtime.logger,
     capabilities,
     catalog,
     policies,
+    projects,
   });
   const idempotency = new IdempotencyStore({
     db: runtime.db,

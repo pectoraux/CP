@@ -27,8 +27,11 @@
 // middlewares — never raw request params. The service re-verifies
 // server-side (the WORK-008 policies precedent): the acting principal
 // must hold an ACTIVE membership in the organization, and the project
-// must belong to it. The policy is loaded ONLY within that scope, so
-// cross-tenant policy evaluation cannot resolve.
+// must belong to it — resolved through the /projects PUBLIC interface
+// (getProject), never raw cp_projects SQL (architect review of PR #8:
+// /eligibility must not become a second project authority). The policy
+// is loaded ONLY within that scope, so cross-tenant policy evaluation
+// cannot resolve.
 //
 // Statelessness (§26): eligibility persists NOTHING — no tables, no
 // candidate state, no cache. Each evaluation loads a fresh snapshot
@@ -38,8 +41,6 @@
 
 import {
   AppError,
-  type Database,
-  ulid,
   Logger,
   type LogSink,
   type LogRecord,
@@ -49,6 +50,7 @@ import { activeMembershipIn } from "@cp/auth";
 import type { CapabilitiesService } from "@cp/capabilities";
 import type { CatalogService, CatalogOffering } from "@cp/catalog";
 import type { PoliciesService, PolicyRule } from "@cp/policies";
+import type { ProjectsService } from "@cp/projects";
 import {
   validateConstraints,
   validateProviders,
@@ -108,11 +110,15 @@ export interface EligibilityEvaluateInput {
 }
 
 export interface EligibilityServiceOptions {
-  db: Database;
   logger?: Logger;
   capabilities: CapabilitiesService;
   catalog: CatalogService;
   policies: PoliciesService;
+  /** The projects public interface — project existence and tenant
+   * ownership are resolved HERE (architect review of PR #8: /eligibility
+   * must not query cp_projects directly and become a second project
+   * authority). */
+  projects: ProjectsService;
 }
 
 const NOOP_SINK: LogSink = {
@@ -125,18 +131,18 @@ const MAX_ENUMERATION_PAGES = 100;
 // ---- Service -------------------------------------------------------------------
 
 export class EligibilityService {
-  private readonly db: Database;
   private readonly logger: Logger;
   private readonly capabilities: CapabilitiesService;
   private readonly catalog: CatalogService;
   private readonly policies: PoliciesService;
+  private readonly projects: ProjectsService;
 
   constructor(opts: EligibilityServiceOptions) {
-    this.db = opts.db;
     this.logger = opts.logger ?? new Logger({ sink: NOOP_SINK, level: "warn" });
     this.capabilities = opts.capabilities;
     this.catalog = opts.catalog;
     this.policies = opts.policies;
+    this.projects = opts.projects;
   }
 
   // ---- Tenancy + authorization (§24) ----------------------------------------
@@ -144,10 +150,13 @@ export class EligibilityService {
   /**
    * Verify the (organizationId, projectId) scope is real and belongs
    * together, and that the acting principal holds an ACTIVE membership
-   * (any role — evaluation is a read). The same server-side pattern the
-   * policies service uses (defense in depth on top of the /api gates);
-   * no second tenant system is invented. A suspended/removed member
-   * fails this check and loses eligibility access.
+   * (any role — evaluation is a read). Project existence/ownership is
+   * resolved through the /projects PUBLIC interface (getProject is the
+   * org-scoped tenant query — architect review of PR #8: /eligibility
+   * must not duplicate it with raw SQL). The same server-side pattern
+   * the policies service uses (defense in depth on top of the /api
+   * gates); no second tenant system is invented. A suspended/removed
+   * member fails this check and loses eligibility access.
    */
   private async requireProjectScope(
     organizationId: string,
@@ -161,11 +170,8 @@ export class EligibilityService {
         organization_id: organizationId,
       });
     }
-    const rows = await this.db.query({
-      text: `SELECT id FROM cp_projects WHERE id = $1 AND organization_id = $2`,
-      params: [projectId, organizationId],
-    });
-    if (rows.length === 0) {
+    const project = await this.projects.getProject(organizationId, projectId);
+    if (!project) {
       throw notFound("eligibility.project.not_found", "the project does not exist in this organization", {
         project_id: projectId,
       });
@@ -333,8 +339,11 @@ export class EligibilityService {
       indeterminate: results.filter((r) => r.status === "indeterminate").length,
     };
 
+    // Observability (architect review of PR #8): no fabricated
+    // request_id — request correlation belongs to the /api correlation
+    // middleware, which already attaches the real request id to the
+    // logging context.
     this.logger.info("eligibility: evaluated", {
-      request_id: ulid(), // correlation only — never used in the result
       organization_id: input.organizationId,
       project_id: input.projectId,
       capability_id: input.capabilityId,

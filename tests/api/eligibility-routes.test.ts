@@ -87,8 +87,20 @@ const ECHO_CONTRACT = {
   side_effect: "pure",
 };
 
-/** Seed the global demo.echo offering (capability@1 + provider + declaration). */
-async function seedEcho(app: ReturnType<typeof createApi>["app"], ownerKey: string, t: string): Promise<void> {
+/** Seed the global demo.echo offering (capability@1 + provider + declaration)
+ * with the provider in the AUTHORITATIVE ACTIVE lifecycle state (only the
+ * active state is eligible — architect review of PR #8). The `active`
+ * state's live-certification evidence gate is unreachable with the fixture
+ * adapter, so the final state is set via the providers service with the
+ * deployment-bootstrapped admin — this helper seeds an ELIGIBILITY
+ * candidate; the provider lifecycle itself is WORK-006's tested surface.
+ */
+async function seedEcho(
+  app: ReturnType<typeof createApi>["app"],
+  api: ReturnType<typeof createApi>,
+  ownerKey: string,
+  t: string,
+): Promise<void> {
   const auth = { "content-type": "application/json", authorization: `Bearer ${ownerKey}` };
   await app.request("/v1/capabilities", {
     method: "POST",
@@ -112,6 +124,25 @@ async function seedEcho(app: ReturnType<typeof createApi>["app"], ownerKey: stri
   await app.request(`/v1/providers/${encodeURIComponent("demo.echo")}/capabilities`, {
     method: "POST", headers: auth,
     body: JSON.stringify({ capability_id: "demo.echo", capability_version: "1" }),
+  });
+  // Fixture contract tests → declaration contract_verified (evidence for
+  // the contract_tested step), then walk the evidence-gated lifecycle.
+  await app.request(
+    `/v1/providers/${encodeURIComponent("demo.echo")}/capabilities/${encodeURIComponent("demo.echo")}/versions/1/certification-tests`,
+    { method: "POST", headers: auth, body: JSON.stringify({}) },
+  );
+  for (const status of ["integrating", "contract_tested", "observed"]) {
+    await app.request(`/v1/providers/${encodeURIComponent("demo.echo")}/lifecycle`, {
+      method: "POST", headers: auth, body: JSON.stringify({ status }),
+    });
+  }
+  // Final authoritative ACTIVE state: the HTTP `certified` gate requires
+  // live evidence (fixture-unreachable) — set it via the api's runtime
+  // database handle (PostgresDatabase from createApi's injected db).
+  const db = (api as unknown as { runtime: { db: { exec: (o: { text: string; params: unknown[] }) => Promise<unknown> } } }).runtime.db;
+  await db.exec({
+    text: `UPDATE cp_providers SET status = 'active' WHERE provider_id = $1`,
+    params: ["demo.echo"],
   });
 }
 
@@ -151,7 +182,7 @@ describe("WORK-009 eligibility routes (real PG, in-app)", () => {
         const me = await app.request("/v1/auth/me", { headers: { authorization: `Bearer ${tenant.ownerKey}` } });
         const userId = ((await me.json()) as { user: { id: string } }).user.id;
         await api.capabilities.bootstrapCapabilityAdmin({ userId });
-        await seedEcho(app, tenant.ownerKey, t);
+        await seedEcho(app, api, tenant.ownerKey, t);
         await app.request("/v1/catalog/pricing", {
           method: "POST", headers: ownerAuth,
           body: JSON.stringify({
@@ -282,7 +313,7 @@ describe("WORK-009 eligibility routes (real PG, in-app)", () => {
         const t = `${Date.now()}`;
         const a = await makeTenant(app, api, `${t}-a`);
         const b = await makeTenant(app, api, `${t}-b`);
-        await seedEcho(app, a.ownerKey, t);
+        await seedEcho(app, api, a.ownerKey, t);
         const policyId = await seedPolicy(app, a, "a-policy", [
           { subject: "country", operator: "eq", value: "GH", mode: "hard" },
         ]);

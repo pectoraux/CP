@@ -179,17 +179,30 @@ describe("WORK-009 pure evaluator — check semantics", () => {
     expect(r.policy?.preferenceViolated.length).toBe(0);
   });
 
-  it("provider lifecycle: suspended / deprecated / revoked are ineligible; active passes", () => {
+  it("provider lifecycle: ONLY the authoritative active state is eligible — onboarding, suspended, deprecated, revoked all fail (architect review of PR #8)", () => {
+    // Pre-active onboarding states must NOT become production candidates.
+    for (const status of ["discovered", "integrating", "contract_tested", "observed"]) {
+      const r = evaluate(offering({ providerStatus: status }), {});
+      expect(r.status, `onboarding provider ${status} must be ineligible`).toBe("ineligible");
+      const check = r.failures.find((c) => c.checkId === "provider.status")!;
+      expect(check.actual).toBe(status);
+      expect(check.expected).toBe("provider in the active lifecycle state");
+      expect(check.reason).toContain("still onboarding");
+    }
+    // Operational off-ramps fail with their own reason.
     for (const status of ["suspended", "deprecated", "revoked"]) {
       const r = evaluate(offering({ providerStatus: status }), {});
       expect(r.status, `provider ${status} must be ineligible`).toBe("ineligible");
       const check = r.failures.find((c) => c.checkId === "provider.status")!;
       expect(check.actual).toBe(status);
-      expect(check.expected).toContain("not suspended/deprecated/revoked");
+      expect(check.expected).toBe("provider in the active lifecycle state");
+      expect(check.reason).toBe(`provider is ${status}`);
     }
+    // Only the authoritative active state passes.
     const active = evaluate(offering({ providerStatus: "active" }), {});
     const check = active.checks.find((c) => c.checkId === "provider.status")!;
     expect(check.result).toBe("pass");
+    expect(check.reason).toBe("provider is active");
   });
 
   it("retired capability version is ineligible with an explainable reason", () => {
