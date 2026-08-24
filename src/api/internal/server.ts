@@ -28,6 +28,11 @@ import {
   migrateCapabilitiesSchema,
 } from "@cp/capabilities";
 import {
+  ProvidersService,
+  migrateProvidersSchema,
+  createDefaultAdapterRegistry,
+} from "@cp/providers";
+import {
   correlationMiddleware,
   errorMiddleware,
   errorHandler,
@@ -37,6 +42,7 @@ import { createPlatformRoutes } from "./handlers.ts";
 import { createAuthRoutes } from "./handlers-auth.ts";
 import { createProjectRoutes } from "./handlers-projects.ts";
 import { createCapabilityRoutes } from "./handlers-capabilities.ts";
+import { createProviderRoutes } from "./handlers-providers.ts";
 import {
   IdempotencyStore,
   migrateIdempotencySchema,
@@ -49,14 +55,19 @@ export interface Api {
   orgs: OrganizationsService;
   projects: ProjectsService;
   capabilities: CapabilitiesService;
+  providers: ProvidersService;
   idempotency: IdempotencyStore;
   /**
    * Create or update the /auth + /organizations + /projects + capabilities
-   * + idempotency schema on the configured database. Idempotent. Safe to
-   * call on every startup. Must be called before auth/org/project/
-   * capability routes will function. Throws on DB failure so
-   * misconfiguration is explicit (no silent no-schema fallback) — the
-   * serve() readiness gate refuses to bind the HTTP listener if this fails.
+   * + providers + idempotency schema on the configured database.
+   * Idempotent. Safe to call on every startup. Must be called before
+   * auth/org/project/capability/provider routes will function. Throws on
+   * DB failure so misconfiguration is explicit (no silent no-schema
+   * fallback) — the serve() readiness gate refuses to bind the HTTP
+   * listener if this fails.
+   *
+   * Ordering: the /providers migration references cp_capabilities
+   * (cross-module FK), so it runs AFTER the /capabilities migration.
    */
   migrate(): Promise<void>;
 }
@@ -93,6 +104,18 @@ export function createApi(
     db: runtime.db,
     logger: runtime.logger,
   });
+  // WORK-006: the provider registry consumes the capability catalog
+  // through its public interface (providers → capabilities is the legal
+  // direction — the capability graph is upstream of providers) and the
+  // default first-party adapter registry (deterministic demo.echo
+  // fixture; production provider integrations are out of scope for
+  // WORK-006).
+  const providers = new ProvidersService({
+    db: runtime.db,
+    logger: runtime.logger,
+    capabilities,
+    adapters: createDefaultAdapterRegistry(),
+  });
   const idempotency = new IdempotencyStore({
     db: runtime.db,
     logger: runtime.logger,
@@ -117,6 +140,14 @@ export function createApi(
   // capability-admin grant (checked inside CapabilitiesService); read
   // routes are authenticated-only.
   createCapabilityRoutes({ runtime, auth, orgs, capabilities, idempotency }, app);
+  // WORK-006 provider routes under /v1/providers. Like capabilities, these
+  // are GLOBAL (not tenant-scoped): the auth middleware verifies the
+  // credential and builds the Principal; mutation routes require the
+  // CP-level capability-admin grant (checked inside ProvidersService); read
+  // routes are authenticated-only. Provider registry rows contain NO
+  // tenant connection data and NO secrets (credential REQUIREMENTS are
+  // metadata only; actual secrets belong to the future connections layer).
+  createProviderRoutes({ runtime, auth, orgs, providers, idempotency }, app);
 
   // Start the in-process worker so enqueued jobs actually run.
   runtime.queue.start();
@@ -126,10 +157,11 @@ export function createApi(
     await migrateOrganizationsSchema(runtime.db as Database);
     await migrateProjectsSchema(runtime.db as Database);
     await migrateCapabilitiesSchema(runtime.db as Database);
+    await migrateProvidersSchema(runtime.db as Database);
     await migrateIdempotencySchema(runtime.db as Database);
   };
 
-  return { app, runtime, auth, orgs, projects, capabilities, idempotency, migrate };
+  return { app, runtime, auth, orgs, projects, capabilities, providers, idempotency, migrate };
 }
 
 export interface ServeOptions extends RuntimeOptions {
