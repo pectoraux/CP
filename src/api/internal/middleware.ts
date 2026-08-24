@@ -31,13 +31,16 @@ import {
 import { AppError } from "@cp/platform";
 import type { AuthService, Principal } from "@cp/auth";
 import type { OrganizationsService, OrgContext } from "@cp/organizations";
+import type { ProjectsService, ProjectContext } from "@cp/projects";
 
 // The Hono app-wide variables. Extended from WORK-001's { requestId } to
-// carry the resolved Principal and OrgContext through the request.
+// carry the resolved Principal, OrgContext (WORK-003), and ProjectContext
+// (WORK-004) through the request.
 export interface AuthVars {
   requestId: string;
   principal?: Principal;
   orgContext?: OrgContext;
+  projectContext?: ProjectContext;
 }
 
 /** Backwards-compatible alias for the WORK-001 variables shape. */
@@ -283,5 +286,61 @@ export function orgContextMiddleware(
     await runInContextAsync(execCtx, async () => {
       await next();
     });
+  };
+}
+
+// ---- WORK-004 project-level tenant-scoping middleware ----------------
+
+/**
+ * Project-level tenant-scoping middleware (WORK-004). For routes with a
+ * `:projectId` path param (under an already-org-resolved `:orgId`): resolve
+ * the project via ProjectsService.resolveProjectContext against the
+ * AUTHORIZED org id from `orgContext` (set by orgContextMiddleware). Throws
+ * POLICY_BLOCKED (project.not_found) if the project does not exist in this
+ * org — the existence of a project in a different org is never leaked to a
+ * caller who has no membership there.
+ *
+ * The resolved ProjectContext is `c.get('projectContext')` and its
+ * projectId/organizationId are the AUTHORIZED ones — downstream handlers
+ * must use them, never the raw path params.
+ *
+ * This middleware MUST run after orgContextMiddleware so that the org-level
+ * gate (principal is an active member of :orgId) has already passed and the
+ * authorized org id is available.
+ */
+export function projectContextMiddleware(
+  _runtime: Runtime,
+  projects: ProjectsService,
+): MiddlewareHandler<{ Variables: AuthVars }> {
+  return async (c, next) => {
+    const orgCtx = c.get("orgContext");
+    if (!orgCtx) {
+      // Programmer error: projectContextMiddleware used without a prior
+      // orgContextMiddleware on the route. Surface as a structured
+      // platform failure rather than a confusing null deref downstream.
+      throw new AppError({
+        category: "PLATFORM_FAILURE",
+        code: "project.context.org_required",
+        message: "project context requires a resolved organization context",
+        retryable: false,
+      });
+    }
+    const requestedProjectId = c.req.param("projectId");
+    if (typeof requestedProjectId !== "string" || requestedProjectId.length === 0) {
+      throw new AppError({
+        category: "POLICY_BLOCKED",
+        code: "project.id.required",
+        message: "project id is required",
+        retryable: false,
+      });
+    }
+    // The server-side project-level gate. requestedProjectId is only a
+    // TARGET; the project must belong to the AUTHORIZED organization.
+    const projectCtx = await projects.resolveProjectContext(
+      orgCtx.organizationId,
+      requestedProjectId,
+    );
+    c.set("projectContext", projectCtx);
+    await next();
   };
 }
