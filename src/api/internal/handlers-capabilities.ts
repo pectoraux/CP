@@ -297,7 +297,14 @@ export function createCapabilityRoutes(
     },
   );
 
-  // ---- Grant capability-admin (bootstrap / admin, idempotent) -------
+  // ---- Grant capability-admin (admin-only, idempotent) ---------------
+  // Architect review of PR #4: this is the NORMAL capability-admin API.
+  // It requires the acting principal to ALREADY be a capability admin —
+  // the service has NO empty-table bootstrap path. The FIRST admin is
+  // created exclusively by the deployment/operator authority
+  // (CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID → serve() startup →
+  // bootstrapCapabilityAdmin), never via this endpoint. A fresh
+  // installation with an ordinary authenticated user gets 403 here.
 
   app.post(
     "/v1/capabilities/admins",

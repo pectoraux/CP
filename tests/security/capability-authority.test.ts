@@ -122,9 +122,12 @@ describe("WORK-005 capability authority (global catalog isolation)", () => {
         // Even the OTHER mutation paths are gated: a non-admin cannot
         // transition, create-version, or add-dependency (a capability must
         // exist first; bootstrap an admin to create one, then prove a
-        // non-admin cannot mutate it).
+        // non-admin cannot mutate it). The bootstrap here is the
+        // deployment/operator-authority path (NOT the tenant API) — the
+        // table is empty, so bootstrapCapabilityAdmin grants the first
+        // admin without any acting principal.
         const admin = await makeUser(auth, 5);
-        await capabilities.grantCapabilityAdmin({ userId: admin.id, actingPrincipal: buildPrincipal(admin.id, []) });
+        await capabilities.bootstrapCapabilityAdmin({ userId: admin.id });
         const adminP = buildPrincipal(admin.id, []);
         await capabilities.createCapability({ capabilityId: "secure.cap", name: "Sec", actingPrincipal: adminP });
         // ownerA (org owner, not a capability admin) cannot transition it.
@@ -148,12 +151,12 @@ describe("WORK-005 capability authority (global catalog isolation)", () => {
     await withInfra(async (handle) => {
       const { auth, capabilities, cleanup } = await setup(handle);
       try {
-        // A user with NO org membership at all, granted capability-admin.
+        // A user with NO org membership at all, granted capability-admin
+        // via the deployment/operator-authority bootstrap path (the table
+        // is empty; bootstrapCapabilityAdmin has no acting principal and
+        // is never exposed over HTTP).
         const adminUser = await makeUser(auth, 1);
-        await capabilities.grantCapabilityAdmin({
-          userId: adminUser.id,
-          actingPrincipal: buildPrincipal(adminUser.id, []),
-        });
+        await capabilities.bootstrapCapabilityAdmin({ userId: adminUser.id });
         const adminP = buildPrincipal(adminUser.id, []);
         // Can create + publish + version + add-dependency.
         const cap = await capabilities.createCapability({

@@ -12,15 +12,25 @@
 //   - the CP-level platform-admin grant that gates global catalog mutations
 //     (cp_capability_admins) — distinct from org-membership roles
 //
-// Authority (WORK-005 §12, §15, §22): capabilities are GLOBAL CP-level
-// primitives; a semantic capability such as `payment.accept` is not owned by
-// a single organization. There is NO organization_id/project_id on the global
-// capability identity. Mutations (create/publish/version/deprecate/retire,
-// add-dependency, grant-admin) require the acting principal to be a
-// capability admin (a row in cp_capability_admins). Reads (get/list/graph)
-// are authenticated-only — any active principal may inspect the global
-// catalog. An arbitrary org owner/admin without a capability-admin grant
-// CANNOT mutate the catalog (proven in tests/security/capability-authority).
+// Authority (WORK-005 §12, §15, §22, architect review of PR #4): capabilities
+// are GLOBAL CP-level primitives; a semantic capability such as
+// `payment.accept` is not owned by a single organization. There is NO
+// organization_id/project_id on the global capability identity. Mutations
+// (create/publish/version/deprecate/retire, add-dependency, grant-admin)
+// require the acting principal to be a capability admin (a row in
+// cp_capability_admins). Reads (get/list/graph) are authenticated-only —
+// any active principal may inspect the global catalog. An arbitrary org
+// owner/admin without a capability-admin grant CANNOT mutate the catalog
+// (proven in tests/security/capability-authority).
+//
+// Bootstrap authority (architect review of PR #4): the FIRST capability
+// admin is created EXCLUSIVELY by the deployment/operator authority — the
+// CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID configuration processed by serve()
+// at startup via bootstrapCapabilityAdmin(). The normal tenant API
+// (POST /v1/capabilities/admins → grantCapabilityAdmin) NEVER self-
+// bootstraps on an empty table; it only permits an EXISTING capability
+// admin to grant another. A tenant user cannot bootstrap themselves into
+// global catalog administration merely because the installation is new.
 //
 // Immutability (WORK-005 §18): once a capability version reaches status
 // 'active' (published), its contract fields are IMMUTABLE. The service
@@ -364,24 +374,37 @@ export class CapabilitiesService {
   }
 
   /**
-   * Grant capability-admin authority to a user. Requires either:
-   *   (a) the table is EMPTY (bootstrap — the first admin may be granted by
-   *       any authenticated caller; this is the one-time platform bootstrap),
-   *   or (b) the acting principal is already a capability admin.
+   * Grant capability-admin authority to a user. This is the NORMAL
+   * capability-admin API (WORK-005 §22): it requires the acting principal
+   * to ALREADY be a capability admin. There is NO empty-table bypass —
+   * the first admin is bootstrapped via the deployment/operator authority
+   * path (`bootstrapCapabilityAdmin`), never via this method.
+   *
    * The grant is idempotent (INSERT ... ON CONFLICT DO NOTHING).
+   *
+   * Authority correction (architect review of PR #4): the previous
+   * implementation allowed any authenticated principal to grant the first
+   * admin when the table was empty. That defeated the purpose of a
+   * CP-level platform-admin authority — a tenant user could bootstrap
+   * themselves into global catalog administration merely because the
+   * installation was new. The normal API now ONLY permits:
+   *
+   *     existing capability admin → grant another capability admin
+   *
+   * The first admin is created exclusively by the deployment/bootstrap
+   * configuration (CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID) processed in
+   * serve() at startup (see bootstrapCapabilityAdmin below).
    */
   async grantCapabilityAdmin(input: {
     userId: string;
     actingPrincipal: Principal;
   }): Promise<void> {
-    const isEmpty = await this.adminTableEmpty();
-    if (!isEmpty) {
-      const ok = await this.isCapabilityAdmin(input.actingPrincipal.userId);
-      if (!ok) {
-        throw policyBlocked("capability.admin.required", "capability.manage authority is required to grant capability-admin", {
-          reason: "not_a_capability_admin",
-        });
-      }
+    const ok = await this.isCapabilityAdmin(input.actingPrincipal.userId);
+    if (!ok) {
+      throw policyBlocked("capability.admin.required", "capability.manage authority is required to grant capability-admin", {
+        reason: "not_a_capability_admin",
+        acting_user_id: input.actingPrincipal.userId,
+      });
     }
     await this.db.exec({
       text: `INSERT INTO cp_capability_admins (user_id, permission, granted_by_user_id)
@@ -392,8 +415,76 @@ export class CapabilitiesService {
     this.logger.info("capabilities: granted capability-admin", {
       granted_user_id: input.userId,
       granted_by: input.actingPrincipal.userId,
-      bootstrap: isEmpty,
     });
+  }
+
+  /**
+   * Bootstrap the FIRST capability-admin grant on a fresh installation.
+   * This is the DEPLOYMENT/OPERATOR authority path (WORK-005 §22
+   * correction): it is NOT exposed over HTTP, has NO acting principal,
+   * and only grants when the cp_capability_admins table is EMPTY. When
+   * the table already has admins, this is an idempotent no-op (logged)
+   * so re-deploys and config-reloads do not grant new admins.
+   *
+   * The granted_by_user_id column is NULL — this is the deployment
+   * authority, not a user-mediated grant. The grant is idempotent
+   * (INSERT ... ON CONFLICT DO NOTHING) so concurrent calls (e.g. two
+   * serve() instances racing) are safe.
+   *
+   * Authority model:
+   *
+   *     deployment/bootstrap configuration (env var)
+   *               ↓
+   *     initial capability admin  ←  THIS method
+   *               ↓
+   *     normal capability-admin API (grantCapabilityAdmin)
+   *               ↓
+   *     subsequent admin grants
+   *
+   * Returns the outcome so the caller (serve()) can log/observe it.
+   */
+  async bootstrapCapabilityAdmin(input: {
+    userId: string;
+    source?: string;
+  }): Promise<{ granted: boolean; reason: "granted" | "already_present" | "table_not_empty" }> {
+    const userId = input.userId.trim();
+    if (userId.length === 0) {
+      throw policyBlocked("capability.validation", "bootstrap user_id is required", {
+        reason: "missing_user_id",
+      });
+    }
+    const source = input.source ?? "deployment-config";
+    const isEmpty = await this.adminTableEmpty();
+    if (!isEmpty) {
+      // The table already has at least one admin. The deployment-config
+      // bootstrap is a one-time initial-admin mechanism; it does NOT
+      // grant new admins on re-deploys (that would let an env-var change
+      // silently add admins). Idempotent no-op + log for observability.
+      this.logger.info("capabilities: bootstrap skipped — admin table not empty", {
+        bootstrap_user_id: userId,
+        source,
+      });
+      return { granted: false, reason: "table_not_empty" };
+    }
+    // The table is empty. Idempotent insert; if a concurrent bootstrap
+    // raced and won, ON CONFLICT DO NOTHING makes this a no-op.
+    await this.db.exec({
+      text: `INSERT INTO cp_capability_admins (user_id, permission, granted_by_user_id)
+             VALUES ($1, 'capability.manage', NULL)
+             ON CONFLICT (user_id, permission) DO NOTHING`,
+      params: [userId],
+    });
+    // Re-check emptiness to determine whether THIS call actually granted
+    // (handles the concurrent-race case where another bootstrap won).
+    const stillEmptyAfter = await this.adminTableEmpty();
+    const granted = !stillEmptyAfter;
+    this.logger.info("capabilities: bootstrap capability-admin", {
+      bootstrap_user_id: userId,
+      source,
+      granted,
+      reason: granted ? "granted" : "already_present",
+    });
+    return { granted, reason: granted ? "granted" : "already_present" };
   }
 
   private async adminTableEmpty(): Promise<boolean> {

@@ -62,11 +62,16 @@ async function makeUser(auth: AuthService, n: number) {
 }
 
 async function bootstrapAdmin(capabilities: CapabilitiesService, userId: string) {
-  // The table is empty → any caller may bootstrap the first admin.
-  await capabilities.grantCapabilityAdmin({
-    userId,
-    actingPrincipal: buildPrincipal(userId, []),
-  });
+  // Deployment/operator-authority bootstrap (architect review of PR #4):
+  // the FIRST capability admin is created exclusively via
+  // bootstrapCapabilityAdmin() — the deployment-bootstrap path that is
+  // NOT exposed over HTTP and has no acting principal. The normal
+  // grantCapabilityAdmin API requires an existing admin and can never
+  // self-bootstrap on an empty table.
+  const result = await capabilities.bootstrapCapabilityAdmin({ userId });
+  if (!result.granted && result.reason === "table_not_empty") {
+    throw new Error("test setup: admin table unexpectedly non-empty (fresh withInfra DB required)");
+  }
 }
 
 function sampleContract(sideEffect: CapabilityContract["sideEffect"] = "idempotent_write"): CapabilityContract {
@@ -541,7 +546,14 @@ describe("CapabilitiesService (real PostgreSQL)", () => {
         const u = await makeUser(auth, 1);
         await bootstrapAdmin(capabilities, u.id);
         const p = buildPrincipal(u.id, []);
-        const id = `race.${ulid().slice(-6).toLowerCase()}`;
+        // The action segment must start with a letter (WORK-005 §5 canonical
+        // id rules reject leading digits). A bare ulid slice starts with a
+        // digit ~31% of the time (Crockford Base32), which made this test
+        // intermittently fail with capability.id.invalid — a latent test
+        // bug in the original WORK-005 commit, surfaced while verifying the
+        // PR #4 correction. Prefix with a letter so the generated id is
+        // always valid while remaining unique per run.
+        const id = `race.r${ulid().slice(-5).toLowerCase()}`;
         const results = await Promise.allSettled([
           capabilities.createCapability({ capabilityId: id, name: "A", actingPrincipal: p }),
           capabilities.createCapability({ capabilityId: id, name: "B", actingPrincipal: p }),

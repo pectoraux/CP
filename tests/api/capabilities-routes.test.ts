@@ -66,7 +66,7 @@ const SAMPLE_CONTRACT = {
 describe("WORK-005 capability routes (real PG, in-app)", () => {
   it("bootstrap admin → create capability (idempotent) → publish → create version → publish → add dependency → inspect graph", async () => {
     await withInfra(async (handle) => {
-      const { app, cleanup } = await setup(handle);
+      const { app, capabilities, cleanup } = await setup(handle);
       try {
         const t = Date.now();
         const key = await registerLogin(app, `cap1-${t}@e.com`);
@@ -76,15 +76,13 @@ describe("WORK-005 capability routes (real PG, in-app)", () => {
         });
         const meBody = (await me.json()) as { user: { id: string } };
         const userId = meBody.user.id;
-        // Bootstrap: the capability-admin table is empty, so the first
-        // grant is allowed for any authenticated caller. Grant the caller's
-        // own id so they become a capability admin.
-        const grant = await app.request("/v1/capabilities/admins", {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-          body: JSON.stringify({ user_id: userId }),
-        });
-        expect(grant.status).toBe(201);
+        // Deployment/operator-authority bootstrap (architect review of
+        // PR #4): the test stands in for the deployment operator and
+        // grants the first capability admin via the service-level
+        // bootstrap path — NOT via the tenant API. The normal
+        // POST /v1/capabilities/admins endpoint requires an existing
+        // admin and can never self-bootstrap on an empty table.
+        await capabilities.bootstrapCapabilityAdmin({ userId });
 
         // Create a capability (idempotent — same Idempotency-Key).
         const idemKey = `cap-idem-${t}`;
@@ -207,9 +205,12 @@ describe("WORK-005 capability routes (real PG, in-app)", () => {
       try {
         const t = Date.now();
         // Register a user and create an org (the user becomes an org owner,
-        // but is NOT a capability admin — the admin table is empty but no
-        // one has bootstrapped, so the table-empty bootstrap path is the
-        // ONLY way in; an org owner without a grant cannot mutate).
+        // but is NOT a capability admin). Even though the admin table is
+        // EMPTY (fresh installation), there is no self-bootstrap path in
+        // the tenant API — the first admin can only be created by the
+        // deployment/operator authority, so an org owner without a grant
+        // cannot mutate (and cannot grant themselves either — proven in
+        // tests/capabilities/bootstrap-authority.test.ts).
         const key = await registerLogin(app, `nonadmin-${t}@e.com`);
         await app.request("/v1/organizations", {
           method: "POST",

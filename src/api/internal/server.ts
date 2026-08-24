@@ -180,6 +180,48 @@ export async function serve(opts: ServeOptions): Promise<ServedApi> {
     }
   }
 
+  // CAPABILITY-ADMIN BOOTSTRAP (architect review of PR #4 / WORK-005 §22):
+  // the FIRST capability admin is granted by the DEPLOYMENT/OPERATOR
+  // authority (CP_BOOTSTRAP_CAPABILITY_ADMIN_USER_ID), never by the normal
+  // tenant API. This runs AFTER the migration gate (the table must exist)
+  // and BEFORE the HTTP listener is bound. Authority model:
+  //
+  //   deployment/bootstrap configuration → initial capability admin
+  //            → normal capability-admin API → subsequent admin grants
+  //
+  // bootstrapCapabilityAdmin only grants when the admin table is empty
+  // (idempotent no-op on re-deploys), so an env-var change cannot silently
+  // add new admins to an already-bootstrapped installation. A DB failure
+  // here aborts startup (same fatal path as a migration failure): the
+  // operator asked for a bootstrap, and a silent skip would create a
+  // security gap where they believe an admin exists when it does not.
+  const bootstrapUserId =
+    runtimeOptions.config?.bootstrapCapabilityAdminUserId;
+  if (bootstrapUserId) {
+    try {
+      const result = await api.capabilities.bootstrapCapabilityAdmin({
+        userId: bootstrapUserId,
+        source: "deployment-config",
+      });
+      if (!result.granted) {
+        api.runtime.logger.info(
+          "api: capability-admin bootstrap not applied (admin table not empty)",
+          { bootstrap_user_id: bootstrapUserId, reason: result.reason },
+        );
+      }
+    } catch (err) {
+      api.runtime.logger.error(
+        "api: startup aborted — capability-admin bootstrap failed",
+        {
+          error: err instanceof Error ? err.message : String(err),
+          bootstrap_user_id: bootstrapUserId,
+        },
+      );
+      await api.runtime.queue.stop().catch(() => {});
+      throw err;
+    }
+  }
+
   // Only bind the listener once the readiness gate has passed. If
   // migrations were requested and failed, this line is never reached.
   const server = Bun.serve({
