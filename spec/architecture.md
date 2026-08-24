@@ -1,1455 +1,172 @@
-# Intelligent Control Plane Architecture
+# Control Plane Architecture
 
-**Version:** 1.0  
-**Status:** FROZEN  
-**Purpose:** Define the architecture of an API-first control plane that composes existing digital capabilities, executes them safely, observes them transparently, and continuously discovers and validates better execution strategies without directly mutating live production strategies.
+## Status
 
----
+FROZEN
 
-# 1. Product Definition
+## Purpose
 
-The platform is an **Intelligent Digital Control Plane** that sits above existing services, products, APIs, infrastructure, and operational systems.
+Control Plane (CP) is an API-first orchestration and optimization layer that operates above existing digital services, infrastructure, APIs, and service providers. It does not replace the systems it orchestrates. It composes their capabilities, executes against them through provider adapters, observes outcomes, and safely evaluates improved strategies without directly mutating an active production strategy.
 
-Its job is not to replace those systems. Its job is to provide a stable semantic layer above them:
+## Core lifecycle
 
-```text
-Business / Application Intent
-          ↓
-Capability
-          ↓
-Eligible Providers
-          ↓
-Strategy
-          ↓
-Execution
-          ↓
-Observation
-          ↓
-Outcome
-          ↓
-Safe Optimization
-```
+Goal → Capability Graph → Policy → Eligibility → Plan → Strategy → Live Execution → Observation → Outcome → Optimization → Experiment → Promotion
 
-The platform is both:
+## Safety principle
 
-1. a **developer-facing orchestration API**, and
-2. a **two-sided marketplace** for capabilities and their providers.
+The live execution plane is deliberately separated from the optimization plane. Optimization may propose, replay, simulate, shadow, canary, evaluate, and recommend strategy changes, but it cannot directly mutate the active production strategy.
 
-The architecture must support both platform-operated provider integrations and provider self-service integrations.
+## Human observability principle
 
----
+Every material execution decision must be inspectable: what was requested, which capabilities/providers were considered, which policies excluded candidates, which strategy version executed, why a route was chosen, what happened at each execution step, what fallbacks were used, what evidence was collected, what outcome occurred, what the optimizer proposed, and why a candidate was promoted, rejected, or rolled back.
 
-# 2. Architectural Principles
+## Marketplace principle
 
-## 2.1 Intent Over Provider
+CP is a two-sided marketplace. Demand-side customers consume capabilities; supply-side providers expose capabilities. Provider integration supports both self-service provider integrations and platform-operated adapters. CP may integrate and certify providers directly from public or private provider APIs/documentation without waiting for the provider to implement a native CP integration.
 
-Customers request capabilities and outcomes rather than binding their application directly to one provider.
+## Developer experience principle
 
-Example:
+The REST API and SDK are the primary product boundary. The experience should be as straightforward and composable as Stripe's developer products, with product interaction quality, visual hierarchy, responsiveness, restraint, and polish at Apple-level quality.
 
-```text
-payment.accept
-```
+## Architecture
 
-rather than:
+Initial deployment is a modular monolith with asynchronous workers. The architecture preserves strict module boundaries so components may later be extracted without changing domain contracts.
 
-```text
-stripe.payment.create
-```
+Primary modules:
 
-Provider choice is an implementation concern unless explicitly constrained by policy or customer preference.
+- `/platform` — runtime foundation, IDs, execution context, queues, persistence, storage, observability
+- `/auth` — authentication and authorization
+- `/organizations` — tenant ownership and membership
+- `/projects` — customer projects and configuration
+- `/goals` — objectives and desired outcomes
+- `/capabilities` — canonical capability definitions and contracts
+- `/providers` — provider adapters and provider-specific implementation details
+- `/catalog` — provider offerings, capability mappings, pricing, constraints, availability, certifications, observed contracts
+- `/connections` — customer/provider connections
+- `/credentials` — secret-reference boundary; credentials are never ordinary domain data
+- `/resources` — provider resources and normalized resource identity
+- `/policies` — customer/system policies and hard constraints
+- `/eligibility` — candidate eligibility evaluation
+- `/plans` — execution plan graphs
+- `/strategies` — immutable strategy versions and active strategy references
+- `/routing` — provider/capability routing
+- `/executions` — authoritative live execution state
+- `/observations` — raw execution and provider observations
+- `/outcomes` — business and technical outcome evaluation
+- `/optimization` — candidate strategy generation and optimization evidence
+- `/experiments` — replay, simulation, shadow, canary, evaluation, promotion, rejection, rollback
+- `/events` — asynchronous domain/application event publication and consumption
+- `/webhooks` — external inbound webhook boundary
+- `/evidence` — evidence and provenance linkage
+- `/audit` — append-oriented audit trail
+- `/llm` — provider-neutral LLM reasoning services
+- `/agents` — provider-neutral agent execution services
+- `/api` — HTTP/API boundary only; no domain authority
+- `/workers` — background execution host and job handlers
 
-## 2.2 Capability Is the Stable Semantic Primitive
+## Authority
 
-A Capability defines a stable operation contract independent of its implementations.
+PostgreSQL is the authoritative CP application state. External provider systems remain authoritative for their provider-native state. Redis is transient coordination and queue infrastructure, not authoritative business state. Object storage holds large artifacts. LLMs and agents are non-authoritative participants that produce proposals, classifications, analyses, and evidence inputs.
 
-Examples include:
+Workflow/execution transitions are controlled by deterministic application services. No provider, LLM, agent, frontend, or API route may directly mutate authoritative state outside its public module contract.
 
-```text
-payment.accept
-payment.refund
-identity.verify
-message.send
-ai.generate
-ai.embed
-compute.run
-storage.put
-search.query
-document.extract
-```
+## API-first integration
 
-Providers implement capabilities.
+The primary public interface is `/v1`. Core resources include goals, capabilities, providers, strategies, executions, experiments, observations, outcomes, connections, and events. Long-running operations return an execution or operation identifier and proceed asynchronously. Webhooks and signed event delivery expose state changes to customers.
 
-## 2.3 PostgreSQL Is the Authoritative Control-Plane System of Record
+The API supports capability-oriented requests rather than provider-specific APIs. Provider selection remains a CP concern unless a customer explicitly constrains it.
 
-Persistent control-plane state is authoritative in PostgreSQL.
+## Capability model
 
-Redis, queues, caches, and transient coordination systems are not authoritative.
+A capability represents a semantic operation independent of its provider. A provider implementation advertises capabilities through normalized contracts. Capability definitions include input/output schema, required context, side effects, idempotency requirements, execution modes, safety class, and observability requirements.
 
-Provider systems remain authoritative for provider-owned resource state.
+## Provider model
 
-## 2.4 Evidence Over Claims
+Providers may be onboarded through:
 
-Provider output, optimizer claims, model-generated reasoning, and execution narratives are not authoritative proof.
+1. Provider self-integration using the public provider onboarding interface.
+2. CP-operated integration using an internal adapter implementation.
 
-Material conclusions must be backed by persisted observations, provider evidence, experiment results, or other traceable evidence whenever practical.
+Provider adapters own authentication, request/response translation, provider-specific error interpretation, rate-limit semantics, provider-specific identifiers, and provider API quirks. Provider-specific code must not leak into domain modules.
 
-## 2.5 Production Stability Is More Important Than Optimization
+A provider moves through discovery, adapter implementation, contract validation, behavioral observation, certification, catalog publication, and continuous health monitoring.
 
-The live execution path is conservative and deterministic.
+## Eligibility vs optimization
 
-The optimizer cannot directly mutate an active production strategy.
+Eligibility is a hard gate. Performance scoring and optimization operate only among eligible candidates. Hard constraints include authorization, capability support, geography, privacy, policy, quotas, credential availability, plan restrictions, provider availability, and other non-negotiable constraints.
 
-Optimization occurs through controlled candidate strategy lifecycles:
+Benchmark evidence must preserve native provider/model capability and observed differences. Benchmarks are never allowed to make providers appear equivalent by suppressing capabilities.
 
-```text
-CANDIDATE
-→ SIMULATED
-→ SHADOWED
-→ CANARY
-→ VALIDATED
-→ PROMOTED
-```
+## Strategy model
 
-Candidates may instead become `REJECTED` or `ROLLED_BACK`.
+A Strategy is immutable and versioned. It defines how an objective is satisfied, including capability composition, routing rules, retry/fallback rules, constraints, and optimization parameters. The active strategy is a pointer to an immutable version, not an editable object.
 
-## 2.6 Strategy Immutability
+Candidate strategy lifecycle:
 
-A Strategy is immutable once published.
+CANDIDATE → SIMULATED → SHADOWED → CANARY → VALIDATED → PROMOTED
 
-Changing behavior produces a new Strategy Version.
+Alternative terminal states:
 
-A live execution always references the exact strategy version used.
+REJECTED, ROLLED_BACK, EXPIRED
 
-This permits deterministic replay, rollback, comparison, and audit.
+Promotion is an explicit, auditable action that creates a new active-strategy reference. The previous strategy remains available for rollback.
 
-## 2.7 Optimization Has No Direct Production Mutation Authority
+## Live execution plane
 
-The Optimization and Experimentation domains may propose, simulate, shadow, evaluate, and recommend strategies.
+The live execution plane uses the active strategy and deterministic runtime protections including idempotency, timeouts, retries, circuit breakers, rate limits, fallback rules, compensation, concurrency limits, and safe failure handling. It does not receive arbitrary live mutations from the optimizer.
 
-They may not directly modify the active production strategy.
+An execution is traceable through an execution ID and strategy version. Every significant step records an observation or evidence reference.
 
-Promotion is a separate controlled domain action with explicit eligibility and evidence requirements.
+## Optimization plane
 
-## 2.8 Human Observability Is a First-Class Product Requirement
+The optimizer consumes historical observations and outcomes and may generate candidate strategies. It can evaluate candidates through:
 
-Every important execution and optimization decision must be explainable to a human operator.
+- Offline analysis
+- Historical replay
+- Simulation
+- Shadow execution
+- Canary rollout
+- Controlled promotion
 
-For a material execution, the platform should expose:
+Optimization decisions require measurable evidence. A language model may propose reasoning or hypotheses, but deterministic policy, eligibility, and promotion controls remain authoritative.
 
-- requested capability and objective;
-- interpreted constraints and policies;
-- eligible candidates;
-- rejected candidates and reasons;
-- selected strategy version;
-- provider selection and routing rationale;
-- execution attempts;
-- retries and fallbacks;
-- observed provider responses;
-- latency and cost;
-- business outcome;
-- relevant evidence;
-- candidate strategy comparisons;
-- experiment status;
-- promotion or rollback reasoning.
+## Human observability
 
-The system must never require users to infer critical behavior from raw logs alone.
+The product must expose both high-level and low-level views:
 
-## 2.9 API First
+- Goal/objective interpretation
+- Candidate provider set
+- Eligibility decisions with reasons
+- Selected strategy and strategy version
+- Step-by-step execution timeline
+- Provider calls and latency/cost/result metadata where safe to expose
+- Retry/fallback/circuit-breaker activity
+- Observed vs expected outcome
+- Shadow/canary comparison
+- Optimization candidate details
+- Promotion/rejection/rollback rationale
+- Evidence and provenance links
 
-The public API is the primary product boundary.
+The UI is a read/command client of backend-authoritative state. It must not invent workflow state.
 
-The web console, SDKs, CLI, and other clients consume the same backend contracts.
+## Developer experience
 
-The platform must remain useful without requiring adoption of the web console.
+API design follows resource-oriented conventions, predictable authentication, idempotency keys, request IDs, pagination, typed errors, stable event schemas, SDK generation/source parity, and local test fixtures. Examples must be copy-pasteable and deterministic.
 
-## 2.10 Provider Independence
+The console is optimized for developers: excellent onboarding, credential/connection setup, capability discovery, request explorer, execution timeline, strategy inspection, experiment controls, provider comparison, logs/evidence, and documentation discoverability.
 
-Domain logic must not depend on provider-specific SDKs, authentication schemes, DOMs, response formats, pricing representations, or transport details.
+## Reliability
 
-Provider-specific behavior resides behind adapters.
+The system is designed for safe degradation. Provider failures should trigger only policy-eligible fallback behavior. Optimizer failures must never stop live execution. Telemetry failures must not become silent causes of business mutation. Promotion requires evidence thresholds and rollback readiness.
 
-## 2.11 First-Party Provider Integration
+## Security
 
-The platform operator must be able to integrate a provider directly from public APIs, documentation, contracts, or observed behavior.
+Tenant boundaries are enforced server-side. Provider credentials are stored only through the secrets boundary and referenced by opaque identifiers. Secrets must not appear in logs, observations, model prompts, audit entries, or frontend state. Webhooks are signature-validated and idempotent. Customer data access is least-privilege.
 
-A provider does not need to implement the platform SDK before its capabilities can appear in the catalog.
+## Auditability
 
-Provider onboarding paths are:
+All privileged operations, strategy promotions, rollbacks, policy changes, provider onboarding/certification actions, connection changes, and administrative operations produce append-oriented audit records with actor, tenant, action, target, request/execution context, timestamp, and evidence references.
 
-```text
-Provider self-integration
-Platform-operated integration
-```
+## Implementation discipline
 
-Both produce the same normalized provider/capability representation.
-
-## 2.12 Eligibility Before Performance Ranking
-
-Candidate selection occurs in this order:
-
-```text
-Capability compatibility
-        ↓
-Policy/security eligibility
-        ↓
-Availability/quota/credential eligibility
-        ↓
-Performance evidence
-        ↓
-Preference / optimization ranking
-```
-
-A candidate that violates a hard constraint cannot win because of a higher benchmark score.
-
-## 2.13 Resilience Is Distinct From Optimization
-
-Failover, timeout handling, retries, circuit breakers, idempotency, rate limiting, and emergency routing exist to keep the live system operating.
-
-They are not dependent on the experimental optimization lifecycle.
-
-## 2.14 Modular Monolith First
-
-The initial implementation is a TypeScript modular monolith with asynchronous workers.
-
-The module boundaries must be explicit enough that high-scale components can later be extracted into services without changing domain contracts.
-
-## 2.15 Asynchronous Long-Running Work
-
-Long-running, retryable, experiment, ingestion, synchronization, and optimization work must execute outside the synchronous HTTP request path.
-
-## 2.16 Tenant Isolation Is Server-Side
-
-Organization and project/resource boundaries are enforced by the backend.
-
-Frontend state does not constitute authorization.
-
-## 2.17 Secrets Are Not Ordinary Domain Data
-
-API keys, provider credentials, tokens, and secret material are accessed through a secrets boundary.
-
-Domain modules receive capability-scoped secret access rather than raw credential values whenever possible.
-
-## 2.18 LLMs Are Reasoning Participants, Not Workflow Authorities
-
-LLMs may interpret intent, propose plans, analyze evidence, identify optimization opportunities, summarize operations, or generate candidate strategies.
-
-They do not own authoritative workflow state, eligibility, promotion, or production mutation.
-
----
-
-# 3. System Context
-
-```text
-                             ┌───────────────────┐
-                             │      DEVELOPERS    │
-                             │     OPERATORS      │
-                             └─────────┬─────────┘
-                                       │
-                               REST / SDK / CLI
-                                       │
-                                       ▼
-┌───────────────────────────────────────────────────────────────────┐
-│                       INTELLIGENT CONTROL PLANE                  │
-│                                                                   │
-│ Capabilities • Catalog • Policy • Planning • Execution           │
-│ Observation • Outcome • Optimization • Experiments • Audit      │
-└───────────┬──────────────────────────┬───────────────────────────┘
-            │                          │
-            ▼                          ▼
-      Provider systems           External event sources
-            │                          │
- ┌──────────┼──────────┐              │
- ▼          ▼          ▼              ▼
-Payments   AI       Compute        Webhooks / telemetry
-Messaging  Identity Storage       provider events
-Data       Search  Logistics
-```
-
-The platform is not itself the provider of every capability.
-
-It is the control plane and marketplace over implementations owned by other systems or by the platform's own integration layer.
-
----
-
-# 4. Runtime Planes
-
-The platform has four logically separated planes.
-
-## 4.1 Control Plane
-
-Owns:
-
-- capabilities;
-- provider catalog;
-- policies;
-- eligibility;
-- strategies;
-- active strategy selection;
-- execution metadata;
-- experiments;
-- optimization decisions;
-- audit records.
-
-## 4.2 Live Execution Plane
-
-Owns the safe mechanics of invoking capabilities:
-
-- provider invocation;
-- timeout;
-- retry;
-- idempotency;
-- circuit breaker;
-- fallback;
-- rate limiting;
-- concurrency control;
-- compensation where applicable.
-
-It must remain safe even if the optimization plane is unavailable.
-
-## 4.3 Observation / Evidence Plane
-
-Records facts about executions and providers:
-
-- provider response metadata;
-- latency;
-- cost;
-- status;
-- retries;
-- fallback;
-- resource utilization;
-- experiment observations;
-- business outcomes;
-- evidence references.
-
-## 4.4 Optimization / Experimentation Plane
-
-Generates and evaluates candidate strategies using:
-
-- historical replay;
-- simulation;
-- shadow execution;
-- canary traffic;
-- A/B experimentation where safe;
-- performance analysis;
-- cost analysis;
-- outcome analysis;
-- optional LLM-assisted reasoning.
-
-The optimization plane cannot bypass live execution safety controls.
-
----
-
-# 5. Public Product Model
-
-The customer-facing model consists of:
-
-```text
-Organization
-  └── Project
-        ├── Capability Requests
-        ├── Connections
-        ├── Policies
-        ├── Strategies
-        ├── Executions
-        ├── Experiments
-        └── Outcomes
-```
-
-Marketplace entities include:
-
-```text
-Provider
-Capability
-ProviderCapability
-ProviderVersion
-Certification
-PricingModel
-Coverage
-ObservedPerformance
-```
-
----
-
-# 6. Capability Model
-
-A Capability is a provider-neutral contract.
-
-A capability contains:
-
-- stable identifier;
-- human-readable name;
-- semantic description;
-- input schema;
-- output schema;
-- error model;
-- side-effect classification;
-- idempotency semantics;
-- required context;
-- supported execution modes;
-- policy-relevant metadata;
-- version.
-
-Capabilities must distinguish at least:
-
-```text
-PURE / READ_ONLY
-IDEMPOTENT_WRITE
-NON_IDEMPOTENT_WRITE
-TRANSACTIONAL
-BEST_EFFORT
-```
-
-This classification informs replay, simulation, shadowing, and experiment eligibility.
-
----
-
-# 7. Provider Model
-
-A Provider represents an implementation supplier.
-
-A provider integration consists of:
-
-```text
-Provider
-  └── Integration
-       ├── Adapter
-       ├── Authentication
-       ├── Capability mappings
-       ├── Normalization rules
-       ├── Health checks
-       ├── Pricing metadata
-       ├── Coverage metadata
-       ├── Contract tests
-       └── Certification state
-```
-
-Provider integrations have lifecycle states:
-
-```text
-DISCOVERED
-→ INTEGRATING
-→ CONTRACT_TESTED
-→ OBSERVED
-→ CERTIFIED
-→ ACTIVE
-```
-
-with:
-
-```text
-SUSPENDED
-DEPRECATED
-REVOKED
-```
-
-A provider can be added by the platform operator without provider-side code changes.
-
----
-
-# 8. Provider Integration Paths
-
-## 8.1 Platform-Operated Integration
-
-The platform team may create an adapter from provider documentation/API behavior.
-
-The integration process must produce:
-
-- normalized interface;
-- authentication boundary;
-- schema mapping;
-- error normalization;
-- capability mapping;
-- health behavior;
-- contract tests;
-- observed behavior record;
-- certification evidence.
-
-## 8.2 Provider Self-Integration
-
-Providers may use the public integration API/SDK to register:
-
-- company/provider metadata;
-- capabilities;
-- endpoints;
-- credentials/authentication requirements;
-- pricing;
-- geographic coverage;
-- quotas;
-- SLAs;
-- webhook/event metadata.
-
-Provider-submitted claims remain claims until verified or certified.
-
----
-
-# 9. Catalog
-
-The catalog is the normalized marketplace inventory.
-
-It answers:
-
-> What can be done, by whom, where, under what constraints, at what price, and with what observed evidence?
-
-The catalog must distinguish:
-
-```text
-DECLARED
-OBSERVED
-VERIFIED
-CERTIFIED
-```
-
-for provider characteristics.
-
-The system must not represent an unverified provider claim as independently verified fact.
-
----
-
-# 10. Policy and Eligibility
-
-A Policy defines hard or preference constraints.
-
-Examples:
-
-```text
-region = EU
-PII must not leave approved geography
-provider must be certified
-max cost < X
-max latency < Y
-required availability > Z
-provider must support capability version N
-```
-
-Eligibility evaluates a concrete request against:
-
-- capability compatibility;
-- project policy;
-- tenant policy;
-- provider status;
-- geographical requirements;
-- credential availability;
-- provider capability;
-- quota;
-- subscription;
-- operational health;
-- compliance restrictions.
-
-Eligibility results must be explainable.
-
----
-
-# 11. Strategy Model
-
-A Strategy is an immutable execution policy.
-
-It contains:
-
-- strategy ID;
-- version;
-- capability graph / execution graph;
-- routing rules;
-- retry/fallback strategy references;
-- constraints;
-- optimization objective;
-- evidence summary;
-- creation timestamp;
-- provenance.
-
-Example:
-
-```text
-payment.accept
- ├── fraud.check → Provider F
- ├── authorize → Provider B
- ├── capture → Provider B
- └── notification → Provider N
-```
-
-A new proposal always creates a new version.
-
----
-
-# 12. Execution Model
-
-Every public capability invocation produces an Execution.
-
-The API should support both immediate acknowledgment and asynchronous completion.
-
-Example:
-
-```http
-POST /v1/executions
-```
-
-with a capability-oriented request.
-
-The platform returns an execution ID.
-
-```http
-GET /v1/executions/{execution_id}
-```
-
-The platform additionally exposes event delivery via webhooks and event subscriptions.
-
-An execution records:
-
-- request;
-- interpreted goal;
-- applicable policies;
-- eligibility snapshot;
-- strategy version;
-- attempts;
-- provider calls;
-- retries;
-- fallback events;
-- outputs;
-- outcome;
-- evidence;
-- final status.
-
----
-
-# 13. Execution Safety
-
-The live execution plane must implement:
-
-- bounded retries;
-- deterministic retry policy;
-- idempotency keys;
-- timeout budgets;
-- provider circuit breakers;
-- fallback rules;
-- rate limiting;
-- concurrency limits;
-- duplicate-delivery tolerance;
-- cancellation where supported;
-- compensation where the capability contract permits it.
-
-Provider failures must not automatically invoke experimental optimization.
-
-The current production strategy remains available while optimization services are unavailable.
-
----
-
-# 14. Observation Model
-
-An Observation is a factual record about something that happened or was measured.
-
-Examples:
-
-```text
-provider = A
-latency_ms = 418
-status = success
-cost = 0.013
-region = GH
-attempt = 1
-```
-
-Observations must be timestamped, correlated to an execution, and associated with relevant strategy/provider versions.
-
-Raw observations should be retained independently from derived scores.
-
----
-
-# 15. Outcome Model
-
-An Outcome describes whether an execution achieved its intended business or technical result.
-
-Examples:
-
-```text
-payment_completed
-message_delivered
-model_response_accepted
-job_completed
-cost_target_met
-latency_target_met
-```
-
-An execution can succeed technically while failing the intended outcome.
-
-Optimization must therefore use outcome evidence where available.
-
----
-
-# 16. Human Observability
-
-The platform UI must make the execution graph inspectable.
-
-A user should be able to move from:
-
-```text
-Goal
-→ Execution
-→ Strategy
-→ Decision
-→ Provider
-→ Attempt
-→ Observation
-→ Outcome
-```
-
-and back again.
-
-For routing decisions the UI should expose a decision explanation:
-
-```text
-Candidate A: eligible
-Candidate B: eligible
-Candidate C: rejected — unsupported region
-
-Selected B because:
-- expected success: 99.1%
-- expected latency: 420 ms
-- expected cost: $0.011
-- policy compliance: yes
-```
-
-The UI must distinguish:
-
-```text
-FACT
-INFERENCE
-MODEL RECOMMENDATION
-POLICY DECISION
-OPERATOR ACTION
-```
-
-This prevents AI-generated explanations from being confused with factual evidence.
-
----
-
-# 17. Optimization Lifecycle
-
-Optimization is an evidence-producing process.
-
-```text
-OBSERVE
-  ↓
-ANALYZE
-  ↓
-GENERATE CANDIDATE
-  ↓
-SIMULATE
-  ↓
-SHADOW
-  ↓
-CANARY
-  ↓
-EVALUATE
-  ↓
-PROMOTE or REJECT
-```
-
-Not every capability is eligible for every stage.
-
-For capabilities with external side effects, shadowing must not duplicate unsafe side effects.
-
-The experiment layer must use capability side-effect classifications to determine safe experiment modes.
-
----
-
-# 18. Replay and Simulation
-
-Replay uses historical execution inputs and relevant contextual state to evaluate a candidate strategy.
-
-A replay record must identify:
-
-- original strategy;
-- candidate strategy;
-- input digest;
-- relevant provider/model versions;
-- policy version;
-- verification conditions;
-- observed outcome;
-- candidate result.
-
-Where true simulation is impossible, the experiment must be explicitly marked as an estimate rather than a production-equivalent result.
-
----
-
-# 19. Shadowing
-
-Shadow execution evaluates a candidate without allowing candidate side effects to affect production.
-
-For read-only and pure capabilities this may be a real provider execution.
-
-For side-effecting capabilities, shadowing must use one of:
-
-- provider sandbox;
-- dry-run API;
-- simulation;
-- recorded-response replay;
-- platform-level side-effect suppression where explicitly supported.
-
-The platform must never assume that a provider has a safe dry-run mode without evidence.
-
----
-
-# 20. Canary and Promotion
-
-Promotion must be gradual when practical.
-
-A canary may use:
-
-```text
-percentage
-customer cohort
-region
-capability subset
-risk class
-```
-
-Promotion gates must be defined by objective thresholds and policy.
-
-The platform records:
-
-- baseline;
-- candidate;
-- sample size;
-- confidence/decision method where applicable;
-- observed metrics;
-- outcome metrics;
-- operator actions;
-- final verdict.
-
-Rollback restores the prior immutable strategy version.
-
----
-
-# 21. Optimization Objectives
-
-An optimization objective may contain multiple dimensions, for example:
-
-```text
-maximize successful outcome
-subject to:
-  cost <= target
-  latency <= target
-  reliability >= target
-  region = approved
-```
-
-Hard constraints remain eligibility filters.
-
-Soft preferences are ranking signals.
-
-The optimizer must preserve the underlying observed measurements; derived scores must not hide them.
-
----
-
-# 22. LLM Integration
-
-The `/llm` boundary may support:
-
-- intent interpretation;
-- plan generation;
-- optimization analysis;
-- experiment explanation;
-- human-readable operational summaries.
-
-LLM provider selection remains provider-independent.
-
-LLM output must be structurally validated before entering deterministic systems.
-
-An LLM cannot:
-
-- directly invoke an arbitrary provider SDK from domain code;
-- directly promote a strategy;
-- directly disable safety rules;
-- directly mutate canonical production state.
-
----
-
-# 23. API Architecture
-
-The public API is REST-first and versioned:
-
-```text
-/v1
-```
-
-Primary resource families:
-
-```text
-/capabilities
-/providers
-/catalog
-/policies
-/strategies
-/executions
-/experiments
-/observations
-/outcomes
-/projects
-/connections
-/webhooks
-```
-
-The API must provide:
-
-- consistent resource IDs;
-- idempotency support for side-effecting operations;
-- request correlation IDs;
-- pagination;
-- structured errors;
-- webhook signatures;
-- stable schema versioning;
-- explicit asynchronous operation states.
-
-SDKs and CLI are generated or implemented against the same public contracts.
-
----
-
-# 24. Developer Experience
-
-Developer UX is a first-class architectural constraint.
-
-The product should feel:
-
-```text
-Stripe-like
-    +
-Apple-like polish
-```
-
-The API should be composable, predictable, typed, and easy to adopt incrementally.
-
-A developer should be able to begin with one capability and one provider integration without adopting the entire platform.
-
-The console should emphasize:
-
-- fast comprehension;
-- clean hierarchy;
-- minimal visual noise;
-- excellent defaults;
-- progressive disclosure;
-- responsive execution timelines;
-- high-quality empty/error/loading states;
-- copyable code and cURL examples;
-- immediate visibility into why a decision occurred.
-
-The web application must not own authoritative workflow or security logic.
-
----
-
-# 25. Webhooks and Events
-
-External events enter through dedicated webhook boundaries.
-
-The canonical ingestion pattern is:
-
-```text
-Provider
-  ↓
-Webhook endpoint
-  ↓
-Signature validation
-  ↓
-Event persistence
-  ↓
-Queue
-  ↓
-Domain handler
-```
-
-Webhook delivery is assumed to be duplicated or delayed.
-
-Handlers must be idempotent.
-
-The platform also emits customer-facing events for material execution and experiment lifecycle changes.
-
----
-
-# 26. Storage and Infrastructure
-
-Initial runtime topology:
-
-```text
-API process
-   │
-   ├── PostgreSQL
-   ├── Redis
-   └── Object Storage
-         │
-         ▼
-      Workers
-```
-
-PostgreSQL stores authoritative control-plane data.
-
-Redis provides asynchronous job queues, locks, and transient cache.
-
-Object storage stores large artifacts, provider evidence payloads, experiment artifacts, and execution snapshots where appropriate.
-
----
-
-# 27. Background Workers
-
-Representative job types include:
-
-```text
-provider.webhook
-provider.sync
-provider.health-check
-catalog.refresh
-execution.run
-execution.retry
-experiment.replay
-experiment.shadow
-experiment.evaluate
-optimization.analyze
-optimization.propose
-strategy.canary
-strategy.promote
-observation.aggregate
-notification.send
-```
-
-Workers receive an execution/correlation identifier that is preserved across asynchronous boundaries.
-
----
-
-# 28. Observability of the Platform
-
-Every platform execution must have traceable identifiers.
-
-Structured logs, metrics, and traces must support:
-
-```text
-request_id
-execution_id
-organization_id
-project_id
-strategy_id
-strategy_version
-provider_id
-experiment_id
-```
-
-Observability itself remains provider-neutral behind interfaces.
-
----
-
-# 29. Audit
-
-Material control-plane operations produce append-oriented audit events.
-
-At minimum:
-
-- policy changes;
-- provider certification state changes;
-- strategy creation;
-- strategy promotion;
-- strategy rollback;
-- connection creation/revocation;
-- experiment configuration;
-- operator overrides;
-- security-sensitive actions.
-
-Audit records must identify actor, action, target, timestamp, reason where required, and relevant evidence/reference IDs.
-
----
-
-# 30. Security Boundary
-
-The platform must separate:
-
-```text
-identity
-authorization
-secret access
-provider credentials
-execution authorization
-```
-
-Provider secrets must never be exposed to client applications when the server can perform the operation safely.
-
-Adapters must receive only the credentials/scopes required for their provider operation.
-
----
-
-# 31. Failure Model
-
-The system must distinguish:
-
-```text
-PROVIDER_FAILURE
-NETWORK_FAILURE
-RATE_LIMITED
-TIMEOUT
-POLICY_BLOCKED
-INELIGIBLE
-CREDENTIAL_FAILURE
-EXECUTION_FAILURE
-OUTCOME_FAILURE
-PLATFORM_FAILURE
-EXPERIMENT_FAILURE
-```
-
-A provider failure must not be represented as a policy failure.
-
-An outcome failure must not automatically mean that the provider call failed.
-
----
-
-# 32. Provider Certification
-
-Certification is evidence-backed.
-
-Certification may assess:
-
-- contract compatibility;
-- authentication;
-- input/output schema;
-- error normalization;
-- idempotency behavior;
-- webhook behavior;
-- latency measurement;
-- pricing evidence;
-- coverage evidence;
-- security requirements;
-- operational reliability.
-
-A provider can remain visible as `OBSERVED` without being `CERTIFIED`.
-
----
-
-# 33. Marketplace Fairness
-
-The marketplace must not secretly favor one provider because it is operated by the platform.
-
-Platform-owned integrations and provider-owned integrations use the same capability and certification abstractions.
-
-Platform ownership can affect operational support and certification confidence, but must not silently falsify observed performance.
-
-Performance data must preserve underlying measurements.
-
----
-
-# 34. Tenant Model
-
-The platform is multi-tenant.
-
-Hierarchy:
-
-```text
-Organization
-  └── Project
-        ├── API Keys / Connections
-        ├── Policies
-        ├── Strategies
-        ├── Executions
-        └── Experiments
-```
-
-All customer-visible resources are tenant-scoped.
-
----
-
-# 35. Module Boundaries
-
-The frozen backend modules are:
-
-```text
-/platform
-/auth
-/organizations
-/projects
-/capabilities
-/providers
-/catalog
-/policies
-/eligibility
-/goals
-/plans
-/executions
-/routing
-/optimization
-/experiments
-/observations
-/outcomes
-/evidence
-/resources
-/connections
-/credentials
-/webhooks
-/events
-/audit
-/llm
-/agents
-```
-
-Each module exposes one public interface entry point.
-
-Other modules may consume only that public interface.
-
-No module may import another module's internal implementation.
-
-`/platform` may not import domain modules.
-
-The API layer may not reach into module internals.
-
----
-
-# 36. Module Ownership
-
-| Module | Responsibility |
-|---|---|
-| `/platform` | runtime foundation, IDs, execution context, queues, database, storage, observability interfaces |
-| `/auth` | authentication, authorization primitives, sessions, API authentication |
-| `/organizations` | organization membership and tenant ownership |
-| `/projects` | projects and customer configuration containers |
-| `/capabilities` | provider-neutral capability contracts and versions |
-| `/providers` | provider integrations and adapter contracts |
-| `/catalog` | normalized marketplace inventory and provider capability facts |
-| `/policies` | hard constraints and preferences |
-| `/eligibility` | deterministic candidate eligibility evaluation |
-| `/goals` | customer objectives and outcome definitions |
-| `/plans` | immutable execution plans/strategies |
-| `/executions` | live execution lifecycle and execution records |
-| `/routing` | candidate routing and provider selection |
-| `/optimization` | analysis, candidate strategy generation, optimization recommendations |
-| `/experiments` | replay, simulation, shadow, canary, evaluation, promotion/rollback |
-| `/observations` | factual execution/provider observations |
-| `/outcomes` | business and technical outcome records |
-| `/evidence` | evidence references and evidence lifecycle |
-| `/resources` | external resource references and resource state snapshots |
-| `/connections` | tenant/provider connection lifecycle |
-| `/credentials` | secret access boundary and provider credential metadata |
-| `/webhooks` | external webhook ingestion |
-| `/events` | domain/customer event publication |
-| `/audit` | append-oriented audit records |
-| `/llm` | provider-neutral LLM access and reasoning services |
-| `/agents` | provider-neutral agent/tool execution where needed |
-
----
-
-# 37. Authority Model
-
-The following authorities are immutable architectural rules:
-
-```text
-/eligibility     → candidate eligibility
-/executions      → live execution state
-/plans           → strategy identity/content
-/experiments     → experiment lifecycle and promotion
-/observations    → observations
-/outcomes        → outcomes
-/policies        → policy definitions
-/providers       → provider adapter implementation boundary
-/audit           → audit records
-```
-
-No LLM, provider, frontend, or adapter may directly mutate another module's authoritative records.
-
----
-
-# 38. State Transitions
-
-## Strategy Lifecycle
-
-```text
-DRAFT
- ↓
-CANDIDATE
- ↓
-VALIDATED
- ↓
-ACTIVE
- ↓
-SUPERSEDED
-```
-
-A candidate may become:
-
-```text
-REJECTED
-```
-
-An active strategy may become:
-
-```text
-ROLLED_BACK
-```
-
-only through the promotion/rollback control path.
-
-## Experiment Lifecycle
-
-```text
-DRAFT
-→ READY
-→ RUNNING
-→ EVALUATING
-→ PROMOTED | REJECTED | ROLLED_BACK
-```
-
-## Execution Lifecycle
-
-```text
-CREATED
-→ ELIGIBILITY_CHECKED
-→ PLANNED
-→ EXECUTING
-→ COMPLETED
-```
-
-Alternative terminal/error paths include:
-
-```text
-BLOCKED
-FAILED
-CANCELLED
-TIMED_OUT
-```
-
-A running execution may enter:
-
-```text
-DEGRADED
-```
-
-when it remains live but has used fallback/recovery behavior.
-
----
-
-# 39. Determinism and Idempotency
-
-Control-plane state transitions are deterministic and idempotent.
-
-Provider invocation idempotency is capability-specific and must be declared by the capability contract.
-
-Duplicate provider events must not produce duplicate logical state transitions.
-
----
-
-# 40. Architecture Changes
-
-The architecture is frozen once version 1.0 is accepted.
-
-Architecture changes require:
-
-1. Architecture Change Request.
-2. Explicit impact analysis.
-3. Approved new immutable architecture version.
-4. Updated requirements/dependency graph/work items as required.
-
-Implementation agents must not modify frozen architecture documents as part of ordinary work.
-
----
-
-# 41. Implementation Workflow
-
-The product implementation follows the WorkflowOS-inspired lifecycle:
-
-```text
-Architecture
-  ↓
-Architecture Lock
-  ↓
-Requirements
-  ↓
-Acceptance Criteria
-  ↓
-Dependency Graph
-  ↓
-Work Items
-  ↓
-Implementation Agent
-  ↓
-Pull Request
-  ↓
-Objective Verification
-  ↓
-Architect Review
-  ↓
-Correction if required
-  ↓
-Merge
-  ↓
-Evidence / Audit
-```
-
-The implementation agent is never the final authority on whether a work item is complete.
-
----
-
-# 42. API and SDK Compatibility
-
-A customer must be able to integrate incrementally.
-
-Minimum adoption path:
-
-```text
-API key
-  ↓
-One connection
-  ↓
-One capability
-  ↓
-One execution
-  ↓
-Observe
-  ↓
-Optionally enable routing
-  ↓
-Optionally enable optimization
-```
-
-No feature may require adopting the entire marketplace.
-
----
-
-# 43. Non-Goals for Version 1
-
-Version 1 does not attempt to:
-
-- automatically integrate every provider in the world;
-- directly modify customer application source code;
-- replace provider control planes;
-- guarantee optimality in a mathematical sense;
-- use LLMs as authoritative controllers;
-- run unsafe shadow side effects;
-- hide provider performance differences behind a single opaque score;
-- require providers to implement platform-specific code before platform-operated integration is possible.
-
----
-
-# 44. Initial Vertical Strategy
-
-The architecture is horizontal, but initial implementation should use a narrow set of capabilities that exercise the hard parts of the system.
-
-The preferred first capability families are:
-
-1. AI inference/model routing.
-2. Payment routing.
-3. Message delivery.
-4. Generic HTTP/service invocation.
-
-These provide different combinations of latency, cost, provider health, side effects, fallbacks, and optimization difficulty.
-
----
-
-# 45. Definition of Architectural Success
-
-Architecture 1.0 succeeds when a customer can:
-
-1. connect an existing provider;
-2. invoke a capability through the API;
-3. see exactly what happened;
-4. inspect why a provider was selected;
-5. observe failure/fallback behavior;
-6. replay historical executions;
-7. create a candidate strategy;
-8. shadow or simulate it safely;
-9. canary it under policy;
-10. compare measured outcomes;
-11. promote or reject it;
-12. roll back to the prior strategy;
-13. do all of this without the live production execution plane depending on the optimizer.
-
-That is the core product contract.
+The repository follows a WorkflowOS-inspired development workflow: frozen architecture, architecture lock, requirements, acceptance criteria, dependency graph, small work items, objective verification, independent architect review, correction cycles, merge gating, and evidence documentation. Implementation agents must inspect the current repository and authoritative spec before changing code and may not redesign frozen architecture within an ordinary work item.

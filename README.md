@@ -1,20 +1,5 @@
-# Control Plane
+# Control Plane (CP)
 
-Intelligent control plane for composing existing digital capabilities, executing them safely, and continuously discovering better strategies without directly mutating live production strategies.
+This repository contains the frozen architecture and implementation plan for Control Plane (CP), an API-first orchestration and optimization layer for existing digital services, infrastructure, and providers.
 
-## Authoritative specification
-
-- `spec/architecture.md` — frozen architecture
-- `spec/architecture-lock.md` — frozen invariants
-- `spec/dependency-graph.md` — dependency and implementation order
-- `spec/work-items.md` — implementation backlog
-
-## Implementation model
-
-The product follows a WorkflowOS-inspired development lifecycle:
-
-Architecture → Requirements → Acceptance Criteria → Work Items → Implementation → Verification → Architect Review → Merge → Evidence
-
-The runtime product follows:
-
-Intent → Capability → Eligibility → Strategy → Execution → Observation → Outcome → Experiment → Promotion
+The authoritative architecture is in `spec/`. Do not modify frozen architecture documents directly. Architectural changes require a new immutable architecture version through the Architecture Change Request process defined in the architecture lock.
