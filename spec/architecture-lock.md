@@ -1,175 +1,134 @@
-# Architecture Lock — Control Plane v1.0
+# Architecture Lock
 
-**Status: FROZEN**
+**Version:** 1.0  
+**Status:** FROZEN
 
-This document is authoritative for the frozen architectural rules of Control Plane (CP). Implementers must not modify this file or `spec/architecture.md` during ordinary work-item execution. Architectural changes require an Architecture Change Request, review, and a new immutable architecture version.
+This document contains the non-negotiable architectural invariants for Control Plane 1.0.
 
-## Core authority invariants
+## 1. Authority
 
-1. PostgreSQL is the authoritative CP application-state store.
-2. External provider systems remain authoritative for provider-native state.
-3. Redis is non-authoritative transient coordination/queue infrastructure.
-4. Object storage is used for large artifacts and is addressed through an abstraction.
-5. `/api` and `/workers` cannot own domain state transitions.
-6. The active production strategy is immutable by identity; changing it means promoting a new immutable strategy version.
-7. The optimizer cannot directly mutate the active production strategy.
-8. Production execution must remain safe when optimization is unavailable.
-9. Eligibility is evaluated before performance ranking/optimization.
-10. Provider-specific SDK/API behavior remains behind `/providers`.
-11. Capability semantics remain independent of provider implementation.
-12. LLMs and agents cannot directly mutate authoritative application or execution state.
-13. Frontend code cannot own authoritative workflow/execution state or authorization.
-14. Tenant isolation is enforced server-side.
-15. Secrets are not ordinary application data and never appear in logs, prompts, observations, audit records, or client state.
+- PostgreSQL is authoritative for application/control-plane state.
+- Provider systems are authoritative for provider-owned external resource state.
+- Redis, queues, caches, and object-storage indexes are not authoritative workflow/control state.
+- `/executions` owns canonical live execution state.
+- `/experiments` owns experiment lifecycle and strategy promotion/rollback.
+- `/plans` owns strategy definitions and versions.
+- `/eligibility` owns candidate eligibility decisions.
+- `/policies` owns policy definitions.
+- `/observations` owns factual observations.
+- `/outcomes` owns outcome records.
+- `/audit` owns the audit trail.
 
-## Execution/optimization separation
+## 2. Production Safety
 
-CP has two architectural planes:
+- The optimization subsystem MUST NOT directly mutate the active production strategy.
+- Active strategies are immutable versions.
+- Strategy changes create new versions.
+- Promotion is an explicit control-plane operation.
+- Rollback restores a prior immutable strategy version.
+- The live execution plane remains functional if optimization is unavailable.
+- Resilience behavior is independent of optimization behavior.
 
-```text
-LIVE EXECUTION PLANE
-active strategy → deterministic execution → observations/outcomes
+## 3. Optimization Lifecycle
 
-OPTIMIZATION PLANE
-observations/outcomes → candidate → simulation → shadow → canary → evaluation → promotion
-```
-
-Optimization may observe production and evaluate alternatives but may not directly rewrite live execution logic.
-
-## Strategy invariants
-
-- Strategy versions are immutable.
-- Every execution references exactly one strategy version.
-- The active strategy is a pointer/reference to an immutable version.
-- Promotions are auditable and reversible.
-- Rollback restores a previously valid strategy reference; it does not rewrite historical strategy records.
-- Candidate strategies are not production strategies until they pass the controlled promotion process.
-
-## Experiment invariants
-
-The experiment lifecycle is:
+Candidate strategies use the lifecycle:
 
 ```text
 CANDIDATE → SIMULATED → SHADOWED → CANARY → VALIDATED → PROMOTED
 ```
 
-Alternative terminal states are `REJECTED`, `ROLLED_BACK`, and `EXPIRED`.
+with rejection and rollback states.
 
-An experiment must preserve the incumbent strategy as the control where comparison is required. Historical replay and simulation must capture the same relevant request/context baseline when claiming comparative validity. Shadow execution has zero production side effects. Canary rollout must support bounded exposure and deterministic abort/rollback criteria.
+- Not every capability must support every experiment mode.
+- Side-effecting capabilities must not receive unsafe duplicate shadow traffic.
+- Provider sandbox/dry-run claims must be verified before being treated as safe experimentation surfaces.
 
-## Human observability invariants
+## 4. Eligibility
 
-Every material execution decision must have enough durable evidence to answer:
+- Eligibility is evaluated before performance ranking.
+- Hard constraints cannot be overridden by benchmark scores.
+- Quota, subscription, credential, privacy, security, capability, geography, and policy restrictions are eligibility filters.
+- Provider performance is a ranking signal only among eligible candidates.
 
-- What objective was requested?
-- What capability was requested?
-- Which providers/candidates were considered?
-- Which candidates were ineligible, and why?
-- Which strategy version was selected?
-- Why was the route selected?
-- What happened during every relevant execution step?
-- Which retries/fallbacks/circuit breakers fired?
-- What outcome was observed?
-- What alternative strategy was being evaluated, if any?
-- What evidence supported promotion/rejection/rollback?
-- Who or what initiated the material action?
+## 5. Evidence
 
-The console must expose this information without requiring database access or model/provider-specific knowledge.
+- Provider claims are not automatically verified facts.
+- LLM-generated reasoning is not verification.
+- Agent output is not verification.
+- Optimization scores cannot replace underlying measurements.
+- Important decisions must retain evidence references.
 
-## Marketplace invariants
+## 6. Human Observability
 
-Two provider entry paths are first-class:
+- Material execution decisions must be inspectable by a human.
+- The UI must distinguish facts, inferences, model recommendations, policy decisions, and operator actions.
+- A user must be able to trace Goal → Execution → Strategy → Decision → Provider → Attempt → Observation → Outcome.
+- Rejected provider candidates must have explainable reasons when observable.
+- Strategy promotion and rollback must be auditable.
 
-```text
-SELF-SERVICE PROVIDER ONBOARDING
-PLATFORM-OPERATED PROVIDER INTEGRATION
-```
+## 7. Provider Independence
 
-CP is permitted to build and operate an adapter for a provider using documented APIs/contracts without requiring the provider to implement CP-specific integration first.
+- Provider-specific SDKs are allowed only inside provider adapters.
+- Domain modules must not import provider SDKs directly.
+- Provider-operated integrations and platform-operated integrations use the same normalized contracts.
+- Providers do not need to self-integrate before the platform may operate an integration.
 
-Provider onboarding must move through explicit contract validation and certification states before normal routing eligibility.
+## 8. Module Boundaries
 
-## API invariants
+- Every backend module exposes one public interface entry point.
+- Cross-module imports may target only another module's public interface.
+- Cross-module imports into `internal/` are forbidden.
+- `/platform` must not import domain modules.
+- API handlers must not import module internals.
 
-- `/v1` is the stable public API boundary.
-- API routes use domain/application interfaces; they never reach into module internals.
-- Long-running operations are asynchronous and return operation/execution identifiers.
-- Request idempotency is supported wherever a request can cause side effects.
-- Every response participating in an asynchronous lifecycle is traceable by execution/request identifiers.
-- Webhook delivery is signed, replay-resistant where practical, and idempotent.
+## 9. API First
 
-## Module boundaries
+- REST `/v1` is the primary external control-plane interface.
+- SDKs and console actions use the same backend authority.
+- Side-effecting API requests must support idempotency keys.
+- Long-running operations return asynchronous execution identifiers.
+- Webhooks/events are supported for asynchronous completion.
 
-Modules are independent bounded contexts with one public entry surface (`index.ts` or equivalent module interface). Cross-module implementation imports are forbidden. Cross-module interaction uses public contracts.
+## 10. Security
 
-Canonical modules:
+- Tenant boundaries are enforced server-side.
+- Provider credentials are not ordinary application data.
+- Provider secrets must not be exposed to client applications when the backend can safely perform the action.
+- Connections and credentials are scoped to tenants/projects and capabilities where applicable.
 
-```text
-/platform
-/auth
-/organizations
-/projects
-/goals
-/capabilities
-/providers
-/catalog
-/connections
-/credentials
-/resources
-/policies
-/eligibility
-/plans
-/strategies
-/routing
-/executions
-/observations
-/outcomes
-/optimization
-/experiments
-/events
-/webhooks
-/evidence
-/audit
-/llm
-/agents
-```
+## 11. State and Idempotency
 
-## No hidden orchestration authority
+- Control-plane state transitions are deterministic and idempotent.
+- Duplicate provider webhooks must produce one logical state effect.
+- The execution plane must preserve execution/correlation IDs across asynchronous work.
 
-No provider adapter, LLM service, agent service, frontend component, webhook handler, or worker may silently change execution or strategy state outside the authoritative application service for that module.
+## 12. Runtime Topology
 
-## Benchmark integrity
+- Version 1 is a modular monolith plus workers.
+- Redis is used for asynchronous coordination and transient mechanisms.
+- PostgreSQL is the authoritative state store.
+- Object storage holds large artifacts/evidence where appropriate.
+- Microservices are not required for Version 1.
 
-Comparative trials must preserve relevant workload/context and must report underlying measurements in addition to derived scores. Eligibility, subscription, quota, privacy, policy, and capability are hard filters, not performance penalties.
+## 13. LLM Authority
 
-## Architecture evolution
+- LLMs may propose plans and candidate strategies.
+- LLMs may not directly promote strategies.
+- LLMs may not disable policy or safety constraints.
+- LLMs may not directly mutate authoritative execution state.
+- LLM outputs entering deterministic systems must be schema-validated.
 
-A frozen architecture version remains immutable. A proposed architecture change creates:
+## 14. Architecture Evolution
 
-1. Architecture Change Request
-2. review decision
-3. new architecture version
-4. updated requirements/acceptance criteria/dependency graph/work items as needed
+- Frozen architecture documents are immutable during ordinary implementation.
+- Architecture changes require an Architecture Change Request and a new architecture version.
+- Work items reference the architecture version they implement.
 
-Historical work items retain their original architecture-version association.
+## 15. Implementation Integrity
 
-## Implementation workflow lock
-
-Implementation proceeds as:
-
-```text
-ARCHITECTURE
-→ ARCHITECTURE LOCK
-→ REQUIREMENTS
-→ ACCEPTANCE CRITERIA
-→ DEPENDENCY GRAPH
-→ WORK ITEMS
-→ IMPLEMENTATION
-→ OBJECTIVE VERIFICATION
-→ INDEPENDENT ARCHITECT REVIEW
-→ CORRECTION CYCLE
-→ MERGE GATE
-→ EVIDENCE
-```
-
-Implementation agents must treat the frozen architecture and lock as authoritative and may not redesign them within an ordinary work item.
+- Every work item has explicit acceptance criteria.
+- Every acceptance criterion requires traceable verification evidence.
+- Implementation-agent claims are insufficient for completion.
+- Verification and architect review are separate concerns.
+- Z.ai and other implementation agents must read the actual codebase before changing code.
+- Implementation agents must work only within the assigned work item scope.
