@@ -80,12 +80,49 @@ export type {
   DbQueryResultRow,
   DbTransaction,
 } from "./internal/db.ts";
+export { PostgresDatabase } from "./internal/db-postgres.ts";
+export type { PostgresDatabaseOptions } from "./internal/db-postgres.ts";
 export { UnconfiguredObjectStorage } from "./internal/storage.ts";
 export type {
   ObjectStorage,
   StorageObject,
   PutObjectInput,
 } from "./internal/storage.ts";
+export { S3CompatibleObjectStorage } from "./internal/storage-s3.ts";
+export type { S3CompatibleObjectStorageOptions } from "./internal/storage-s3.ts";
+
+// ---- Redis-backed queue / lock / cache (DATA-002) -----------------------
+export { RedisJobQueue } from "./internal/queue-redis.ts";
+export type { RedisJobQueueOptions } from "./internal/queue-redis.ts";
+export { RedisCache } from "./internal/cache-redis.ts";
+export type { Cache, RedisCacheOptions } from "./internal/cache-redis.ts";
+export { RedisLockProvider } from "./internal/lock-redis.ts";
+export type {
+  Lock,
+  LockProvider,
+  RedisLockProviderOptions,
+} from "./internal/lock-redis.ts";
+
+// ---- Infrastructure configuration (DATA-001..003, §8 config boundary) ----
+export { loadPlatformConfig, resolveMode } from "./internal/config.ts";
+export type {
+  PlatformConfig,
+  PlatformMode,
+  PostgresConfig,
+  RedisConfig,
+  StorageConfig,
+} from "./internal/config.ts";
+
+// ---- Infrastructure composition & health --------------------------------
+export { createInfrastructure } from "./internal/infra.ts";
+export type { Infrastructure, CreateInfrastructureOptions } from "./internal/infra.ts";
+export { createHealthProbe } from "./internal/health.ts";
+export type {
+  HealthProbe,
+  HealthReport,
+  HealthProbeInputs,
+  ComponentHealth,
+} from "./internal/health.ts";
 
 // ---- Runtime composition -------------------------------------------------
 export { createRuntime } from "./internal/runtime.ts";

@@ -6,3 +6,6 @@ dist/
 .env.local
 bun.lockb
 coverage/
+
+# WORK-002: real infra binaries provisioned by scripts/bootstrap-infra.sh
+.infra/
