@@ -21,7 +21,9 @@ describe("WORK-003 §22 real-socket smoke", () => {
       await migrateOrganizationsSchema(db);
       const port = 47500 + Math.floor(Math.random() * 1000);
       const base = `http://127.0.0.1:${port}`;
-      const api = serve({ port, hostname: "127.0.0.1", db });
+      // serve() is async: with autoMigrate off (we pre-migrated above), it
+      // resolves immediately after binding the listener.
+      const api = await serve({ port, hostname: "127.0.0.1", db });
       try {
         const t = Date.now();
         const emailA = `smk-a-${t}@e.com`;

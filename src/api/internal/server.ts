@@ -91,7 +91,20 @@ export function createApi(
 export interface ServeOptions extends RuntimeOptions {
   port: number;
   hostname?: string;
-  /** When true, run migrations before serving. */
+  /**
+   * When true, run the /auth + /organizations schema migrations before
+   * binding the HTTP listener. This enforces the required startup/
+   * readiness order (architect review of WORK-003):
+   *
+   *   config -> infrastructure -> migrations -> migration success?
+   *                                               |- no  -> startup failure / no readiness
+   *                                               |- yes -> bind HTTP listener
+   *
+   * Migration failure REJECTS serve() so the HTTP listener is never bound
+   * and the process is never "ready" against a missing/partial schema.
+   * The caller (main.ts) MUST await serve() and treat rejection as a
+   * fatal startup error.
+   */
   autoMigrate?: boolean;
 }
 
@@ -100,19 +113,30 @@ export interface ServedApi extends Api {
   stop(): Promise<void>;
 }
 
-export function serve(opts: ServeOptions): ServedApi {
+export async function serve(opts: ServeOptions): Promise<ServedApi> {
   const { port, hostname, autoMigrate = false, ...runtimeOptions } = opts;
   const api = createApi(runtimeOptions);
-  // serve() is synchronous; migrations are launched in the background
-  // when autoMigrate is requested. The caller may also await
-  // api.migrate() explicitly before relying on auth/org routes.
+
+  // STARTUP/READINESS GATE: migrations MUST complete (and MUST succeed)
+  // before the HTTP listener is bound. There is no fire-and-forget path:
+  // a failure here aborts startup, so the process never advertises
+  // readiness against a schema it cannot serve.
   if (autoMigrate) {
-    void api.migrate().catch((err) => {
-      api.runtime.logger.error("api: migration failed", {
+    try {
+      await api.migrate();
+    } catch (err) {
+      api.runtime.logger.error("api: startup aborted — migration failed", {
         error: err instanceof Error ? err.message : String(err),
       });
-    });
+      // The in-process worker was started by createApi(); stop it so the
+      // process can exit cleanly on the caller's fatal-exit path.
+      await api.runtime.queue.stop().catch(() => {});
+      throw err;
+    }
   }
+
+  // Only bind the listener once the readiness gate has passed. If
+  // migrations were requested and failed, this line is never reached.
   const server = Bun.serve({
     port,
     hostname,
