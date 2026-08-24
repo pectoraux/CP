@@ -3,10 +3,23 @@
 //
 // Enforces the frozen module-boundary invariants (architecture §35,
 // architecture-lock §8):
-//   (1) Cross-module imports into another module's `internal/` are forbidden.
-//   (2) `/platform` must not import any domain module (foundational layer).
-//   (3) `/api` (transport layer) must not import module internals — it may
-//       import only public interfaces.
+//   (1) Every module exposes exactly ONE public interface entry point.
+//       The only legal cross-module import form is the bare alias
+//       `@cp/<module>`. Any deeper alias path is forbidden:
+//         - `@cp/<module>/internal/foo`  -> no-cross-module-internal
+//         - `@cp/<module>/foo`           -> no-cross-module-deep-import
+//   (2) Cross-module relative imports are forbidden as an alternative
+//       public surface. A relative import that resolves into another
+//       module is rejected:
+//         - `../../<module>/internal/foo.ts` -> no-cross-module-internal
+//         - `../../<module>/foo.ts`          -> no-cross-module-relative
+//   (3) `/platform` must not import any domain module (foundational layer).
+//   (4) `/api` (transport layer) must not import module internals — it may
+//       import only the bare public interface `@cp/<module>`.
+//
+// At most one violation is emitted per specifier (most specific rule wins)
+// so the failure surface stays legible and synthetic tests can assert exact
+// counts.
 //
 // The same logic is exposed as `analyzeImports()` so tests can feed synthetic
 // forbidden imports and assert detection without polluting the source tree.
@@ -20,9 +33,10 @@ import process from "node:process";
 const ROOT = resolve(import.meta.dirname, "..");
 const SRC = join(ROOT, "src");
 
-// Frozen modules per architecture §35, plus the /api transport layer and the
-// /main process entry. The set is also derivable from the directory tree;
-// listed explicitly to keep the check self-documenting.
+// Frozen modules per architecture §35 (27 modules, including /strategies),
+// plus the /api transport layer and the /main process entry. The set is also
+// derivable from the directory tree; listed explicitly to keep the check
+// self-documenting.
 const FROZEN_MODULES = [
   "platform",
   "auth",
@@ -35,6 +49,7 @@ const FROZEN_MODULES = [
   "eligibility",
   "goals",
   "plans",
+  "strategies",
   "executions",
   "routing",
   "optimization",
@@ -128,6 +143,136 @@ export function classifySpecifier(specifier, importingFile) {
  */
 
 /**
+ * Classify a single import specifier into at most one boundary violation.
+ * Returns null when the specifier is legal. Priority (most specific first):
+ *   1. platform-no-domain-imports — /platform importing any other module
+ *      (bare, deep, internal, or relative). Foundational layering.
+ *   2. api-no-module-internals — /api importing a module's internal surface
+ *      (alias deep-internal or relative into internal/).
+ *   3. no-cross-module-internal — any cross-module import targeting another
+ *      module's internal/ surface.
+ *   4. no-cross-module-deep-import — cross-module alias import with a
+ *      non-internal subpath (e.g. @cp/providers/foo). The only legal
+ *      cross-module alias form is the bare `@cp/<module>`.
+ *   5. no-cross-module-relative — cross-module relative import to a
+ *      non-internal path (e.g. ../../providers/foo.ts). Relative imports may
+ *      not be used as an alternative public surface.
+ *
+ * @param {{ kind: string, module?: string, subpath?: string, target?: string }} c
+ * @param {string} importingModule
+ * @param {string} file
+ * @param {string} specifier
+ * @returns {Violation | null}
+ */
+function classifyViolation(c, importingModule, file, specifier) {
+  if (c.kind === "alias") {
+    const targetModule = c.module || "";
+    if (!targetModule) return null; // malformed @cp/ — not a module boundary concern
+    const isCrossModule = targetModule !== importingModule;
+    if (!isCrossModule) return null; // same-module alias is an internal concern
+    const subpath = c.subpath || "";
+    const isInternal =
+      subpath === "internal" || subpath.startsWith("internal/");
+    const hasSubpath = subpath.length > 0;
+
+    // (1) /platform foundational layering — strongest rule.
+    if (importingModule === PLATFORM) {
+      return {
+        file,
+        specifier,
+        rule: "platform-no-domain-imports",
+        message: `/platform must not import module "${targetModule}" (${specifier})`,
+      };
+    }
+    // (2) /api must not import module internals.
+    if (importingModule === "api" && isInternal) {
+      return {
+        file,
+        specifier,
+        rule: "api-no-module-internals",
+        message: `/api must not import internal of module "${targetModule}" (${specifier})`,
+      };
+    }
+    // (3) cross-module internal import (alias form).
+    if (isInternal) {
+      return {
+        file,
+        specifier,
+        rule: "no-cross-module-internal",
+        message: `module "${importingModule}" imports internal of module "${targetModule}" (${specifier})`,
+      };
+    }
+    // (4) cross-module deep import — subpath under a non-internal public
+    // surface. The only legal cross-module alias form is `@cp/<module>`.
+    if (hasSubpath) {
+      return {
+        file,
+        specifier,
+        rule: "no-cross-module-deep-import",
+        message: `module "${importingModule}" imports deep path of module "${targetModule}" (${specifier}); use @cp/${targetModule} instead`,
+      };
+    }
+    // bare @cp/<module> — the canonical legal cross-module form.
+    return null;
+  }
+
+  if (c.kind === "relative" && c.target) {
+    // Resolve into the src/ tree. Escapes outside src/ are not module
+    // boundary concerns (e.g. importing node_modules via a relative path,
+    // or test helpers).
+    const relToSrc = relative(SRC, c.target);
+    if (!relToSrc || relToSrc.startsWith("..")) {
+      return null;
+    }
+    const segs = relToSrc.split(sep);
+    const targetModule = segs[0] || "";
+    if (!targetModule) return null;
+    const isCrossModule = targetModule !== importingModule;
+    if (!isCrossModule) return null; // same-module relative — allowed
+    const sub = segs.slice(1).join("/");
+    const isInternal = sub === "internal" || sub.startsWith("internal/");
+
+    // (1) /platform foundational layering — strongest rule.
+    if (importingModule === PLATFORM) {
+      return {
+        file,
+        specifier,
+        rule: "platform-no-domain-imports",
+        message: `/platform must not import module "${targetModule}" (${specifier})`,
+      };
+    }
+    // (2) /api must not import module internals.
+    if (importingModule === "api" && isInternal) {
+      return {
+        file,
+        specifier,
+        rule: "api-no-module-internals",
+        message: `/api reaches internal of module "${targetModule}" via relative import (${specifier})`,
+      };
+    }
+    // (3) cross-module internal import (relative form).
+    if (isInternal) {
+      return {
+        file,
+        specifier,
+        rule: "no-cross-module-internal",
+        message: `module "${importingModule}" reaches internal of module "${targetModule}" via relative import (${specifier})`,
+      };
+    }
+    // (5) cross-module relative import to a non-internal path — relative
+    // imports may not be used as an alternative public surface.
+    return {
+      file,
+      specifier,
+      rule: "no-cross-module-relative",
+      message: `module "${importingModule}" imports module "${targetModule}" via relative path (${specifier}); use @cp/${targetModule} instead`,
+    };
+  }
+
+  return null;
+}
+
+/**
  * Analyze a list of source files for boundary violations. Pure function —
  * takes {path, content} pairs and returns violations. Used both by the CLI
  * scan and by the architecture test suite.
@@ -142,81 +287,8 @@ export function analyzeImports(files) {
     const specifiers = extractSpecifiers(content);
     for (const specifier of specifiers) {
       const c = classifySpecifier(specifier, file);
-
-      if (c.kind === "alias") {
-        const { module: targetModule, subpath } = c;
-        const isInternal =
-          subpath &&
-          (subpath === "internal" || subpath.startsWith("internal/"));
-        const isCrossModule = targetModule !== importingModule;
-
-        // Rule (1) / Rule (3): cross-module internal import. Emit the most
-        // specific rule only (avoid double-counting for /api).
-        if (isInternal && isCrossModule) {
-          if (importingModule === "api") {
-            violations.push({
-              file,
-              specifier,
-              rule: "api-no-module-internals",
-              message: `/api must not import internal of module "${targetModule}" (${specifier})`,
-            });
-          } else {
-            violations.push({
-              file,
-              specifier,
-              rule: "no-cross-module-internal",
-              message: `module "${importingModule}" imports internal of module "${targetModule}" (${specifier})`,
-            });
-          }
-        }
-        // Rule (2): /platform must not import any other module.
-        if (importingModule === PLATFORM && targetModule !== PLATFORM) {
-          violations.push({
-            file,
-            specifier,
-            rule: "platform-no-domain-imports",
-            message: `/platform must not import module "${targetModule}" (${specifier})`,
-          });
-        }
-      } else if (c.kind === "relative" && c.target) {
-        // Resolve into src/ tree and check for cross-module internal reach.
-        const relToSrc = relative(SRC, c.target);
-        if (relToSrc && !relToSrc.startsWith("..") && !relToSrc.startsWith(".." + sep)) {
-          const segs = relToSrc.split(sep);
-          const targetModule = segs[0];
-          const sub = segs.slice(1).join("/");
-          if (
-            targetModule &&
-            sub &&
-            (sub === "internal" || sub.startsWith("internal/")) &&
-            targetModule !== importingModule
-          ) {
-            const rule =
-              importingModule === "api"
-                ? "api-no-module-internals"
-                : "no-cross-module-internal";
-            violations.push({
-              file,
-              specifier,
-              rule,
-              message: `module "${importingModule}" reaches internal of module "${targetModule}" via relative import (${specifier})`,
-            });
-          }
-          // /platform foundational rule for relative imports too
-          if (
-            importingModule === PLATFORM &&
-            targetModule &&
-            targetModule !== PLATFORM
-          ) {
-            violations.push({
-              file,
-              specifier,
-              rule: "platform-no-domain-imports",
-              message: `/platform must not import module "${targetModule}" (${specifier})`,
-            });
-          }
-        }
-      }
+      const v = classifyViolation(c, importingModule, file, specifier);
+      if (v) violations.push(v);
     }
   }
   return violations;

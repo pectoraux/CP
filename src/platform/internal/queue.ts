@@ -95,6 +95,12 @@ export class InProcessJobQueue implements JobQueue {
   private readonly concurrency: number;
   private readonly logger: Logger;
   private started = false;
+  // `stopping` is true while stop() is draining pending/running work.
+  // dispatch() keeps draining while (started || stopping) so pending jobs
+  // are not silently abandoned and stop() cannot deadlock. `started` is only
+  // cleared after the queue is fully idle, so enqueue-triggered dispatch
+  // microtasks continue to fire during shutdown.
+  private stopping = false;
   private draining: Array<() => void> = [];
   private activeDispatch = false;
 
@@ -134,8 +140,9 @@ export class InProcessJobQueue implements JobQueue {
       attempts: 0,
     });
     // Non-blocking: defer dispatch to a later microtask so enqueue returns
-    // before any job work begins (PLAT-AC-03).
-    if (this.started) {
+    // before any job work begins (PLAT-AC-03). Also schedule during shutdown
+    // so jobs enqueued before stop() completes are not lost.
+    if (this.started || this.stopping) {
       queueMicrotask(() => void this.dispatch());
     }
     return { jobId: id };
@@ -155,12 +162,28 @@ export class InProcessJobQueue implements JobQueue {
   }
 
   async stop(): Promise<void> {
-    this.started = false;
-    await this.idle();
-    // reject any remaining idle waiters (queue stopped)
-    const waiters = this.draining;
-    this.draining = [];
-    for (const w of waiters) w();
+    // Mark that we are draining. Crucially, `started` stays true so
+    // dispatch() (which checks `started || stopping`) keeps picking up
+    // pending jobs. The previous implementation cleared `started` before
+    // waiting for idle, which prevented dispatch from draining pending
+    // jobs and could deadlock stop() forever.
+    this.stopping = true;
+    // Kick a dispatch in case pending jobs were never picked up — e.g. the
+    // enqueue microtask hasn't fired yet, or start() was never called.
+    void this.dispatch();
+    try {
+      await this.idle();
+    } finally {
+      // Queue is fully drained: no pending, no running. New dispatch is now
+      // a no-op and new enqueues will not schedule work.
+      this.started = false;
+      this.stopping = false;
+      // Resolve any remaining idle waiters so callers awaiting idle() do
+      // not hang after the queue has stopped.
+      const waiters = this.draining;
+      this.draining = [];
+      for (const w of waiters) w();
+    }
   }
 
   getStatus(jobId: string): JobState | undefined {
@@ -184,11 +207,15 @@ export class InProcessJobQueue implements JobQueue {
   }
 
   private async dispatch(): Promise<void> {
-    if (!this.started || this.activeDispatch) return;
+    // Keep draining while the queue is started OR while stop() is draining.
+    // This is the fix for the shutdown deadlock: previously dispatch()
+    // returned as soon as `started` was false, so pending jobs enqueued
+    // before stop() were never run and stop()'s idle() waited forever.
+    if ((!this.started && !this.stopping) || this.activeDispatch) return;
     this.activeDispatch = true;
     try {
       while (
-        this.started &&
+        (this.started || this.stopping) &&
         this.running.size < this.concurrency &&
         this.pending.length > 0
       ) {

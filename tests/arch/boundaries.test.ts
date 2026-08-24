@@ -37,6 +37,28 @@ describe("static architecture check / moduleOf", () => {
     expect(v[0]!.rule).toBe("no-cross-module-internal");
   });
 
+  it("flags cross-module deep import via @cp alias (@cp/<module>/foo)", () => {
+    const v = analyzeImports([
+      {
+        path: f("executions/internal/x.ts"),
+        content: `import { something } from "@cp/providers/foo";`,
+      },
+    ]);
+    expect(v.length).toBe(1);
+    expect(v[0]!.rule).toBe("no-cross-module-deep-import");
+  });
+
+  it("flags cross-module deep import into internal (@cp/<module>/internal/foo)", () => {
+    const v = analyzeImports([
+      {
+        path: f("executions/internal/x.ts"),
+        content: `import { INTERNAL_MODULE } from "@cp/providers/internal/foo";`,
+      },
+    ]);
+    expect(v.length).toBe(1);
+    expect(v[0]!.rule).toBe("no-cross-module-internal");
+  });
+
   it("flags cross-module internal import via relative path", () => {
     const v = analyzeImports([
       {
@@ -46,6 +68,38 @@ describe("static architecture check / moduleOf", () => {
     ]);
     expect(v.length).toBe(1);
     expect(v[0]!.rule).toBe("no-cross-module-internal");
+  });
+
+  it("flags cross-module relative import into a non-internal public file (../../<module>/foo.ts)", () => {
+    const v = analyzeImports([
+      {
+        path: f("executions/internal/x.ts"),
+        content: `import { something } from "../../providers/foo.ts";`,
+      },
+    ]);
+    expect(v.length).toBe(1);
+    expect(v[0]!.rule).toBe("no-cross-module-relative");
+  });
+
+  it("flags cross-module relative import into internal (../../<module>/internal/foo.ts)", () => {
+    const v = analyzeImports([
+      {
+        path: f("executions/internal/x.ts"),
+        content: `import { INTERNAL_MODULE } from "../../providers/internal/foo.ts";`,
+      },
+    ]);
+    expect(v.length).toBe(1);
+    expect(v[0]!.rule).toBe("no-cross-module-internal");
+  });
+
+  it("allows the canonical bare @cp/<module> cross-module form", () => {
+    const v = analyzeImports([
+      {
+        path: f("api/internal/x.ts"),
+        content: `import { createLogger } from "@cp/platform";`,
+      },
+    ]);
+    expect(v).toEqual([]);
   });
 
   it("flags /platform importing a domain module (foundational layering)", () => {
@@ -139,7 +193,7 @@ describe("static architecture check / real source tree", () => {
     expect(violations).toEqual([]);
   });
 
-  it("all 26 frozen modules expose a public index.ts (PLAT-AC-01)", async () => {
+  it("all 27 frozen modules expose a public index.ts (PLAT-AC-01)", async () => {
     const frozen = [
       "platform",
       "auth",
@@ -152,6 +206,7 @@ describe("static architecture check / real source tree", () => {
       "eligibility",
       "goals",
       "plans",
+      "strategies",
       "executions",
       "routing",
       "optimization",
@@ -174,6 +229,29 @@ describe("static architecture check / real source tree", () => {
       );
       expect(idx, `module ${m} must expose src/${m}/index.ts`).not.toBeNull();
     }
-    expect(frozen.length).toBe(26);
+    expect(frozen.length).toBe(27);
+  });
+
+  it("/strategies exposes an internal placeholder (private surface exists)", async () => {
+    const ph = await readFile(
+      join(SRC, "strategies", "internal", "placeholder.ts"),
+      "utf8",
+    ).catch(() => null);
+    expect(ph, "src/strategies/internal/placeholder.ts must exist").not.toBeNull();
+  });
+
+  it("/strategies is part of the frozen module inventory and enforced by the checker", () => {
+    // Reading the checker's FROZEN_MODULES constant indirectly: a deep
+    // cross-module alias into /strategies is rejected with the same rule
+    // as every other frozen module, proving /strategies is a first-class
+    // frozen module.
+    const v = analyzeImports([
+      {
+        path: f("executions/internal/x.ts"),
+        content: `import { thing } from "@cp/strategies/internal/placeholder";`,
+      },
+    ]);
+    expect(v.length).toBe(1);
+    expect(v[0]!.rule).toBe("no-cross-module-internal");
   });
 });
