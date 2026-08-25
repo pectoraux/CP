@@ -312,6 +312,18 @@ export async function withIdempotency(
   store: IdempotencyStore,
   principal: Principal,
   fn: HandlerFn,
+  opts?: {
+    /**
+     * WORK-010 §24-§25 (secrets + idempotency): optional transform applied
+     * to the RAW request body text BEFORE fingerprinting, used by
+     * secret-bearing endpoints to keep raw secret material out of the
+     * persisted request fingerprint. The transform must be deterministic:
+     * the same logical request (including the same secret) must produce
+     * the same transformed text, while the raw secret itself is never
+     * written to cp_idempotency (only the transformed fingerprint is).
+     */
+    fingerprintBody?: (bodyText: string) => string;
+  },
 ): Promise<Response> {
   const key = c.req.header("idempotency-key");
   const userId = principal.userId;
@@ -331,7 +343,8 @@ export async function withIdempotency(
     return fn(body);
   }
 
-  const requestHash = fingerprintRequest(c.req.method, c.req.path, bodyText);
+  const fingerprintText = opts?.fingerprintBody ? opts.fingerprintBody(bodyText) : bodyText;
+  const requestHash = fingerprintRequest(c.req.method, c.req.path, fingerprintText);
 
   // An existing record for this (key, user)?
   const existing = await store.get(key, userId);

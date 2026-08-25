@@ -119,6 +119,36 @@ const PROVIDER_SDK_PACKAGES = [
 // Both rules apply to the BARE alias form only — deep/internal/relative
 // forms are already rejected by the generic cross-module rules, which
 // take priority (at most one violation per specifier).
+// WORK-010 (architect reviews #1 + #2 of PR #9): the credentials
+// capability composition entry (src/credentials/composition.ts) is the
+// ONLY constructor of the privileged credential capabilities
+// (mutationAuthority / adapterResolver). It is NOT part of the module's
+// public interface; it may be imported by EXACTLY ONE trusted file —
+// the composition root — so no ordinary module can manufacture
+// credential authority. This is the designated composition-root
+// mechanism for the runtime object-capability secret boundary.
+const CREDENTIALS_COMPOSITION_SUBPATHS = new Set([
+  "composition",
+  "composition.ts",
+]);
+const CREDENTIALS_COMPOSITION_ROOTS = new Set([
+  "api/internal/server.ts",
+]);
+
+/** Is this file the trusted credentials composition root? */
+function isCredentialsCompositionRoot(file) {
+  const rel = relative(SRC, file).split(sep).join("/");
+  return CREDENTIALS_COMPOSITION_ROOTS.has(rel);
+}
+
+/** Does this subpath under /credentials target the composition entry? */
+function isCredentialsCompositionSubpath(subpath) {
+  return (
+    CREDENTIALS_COMPOSITION_SUBPATHS.has(subpath) ||
+    subpath.startsWith("composition/")
+  );
+}
+
 const DIRECTIONAL_FORBIDDEN = new Map([
   // WORK-008 §22/§25: /policies is tenant-scoped customer configuration
   // (hard constraints + preferences). It may import @cp/platform,
@@ -141,6 +171,7 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "outcomes",
       "evidence",
       "connections",
+      "credentials",
       "resources",
       "providers",
       "webhooks",
@@ -170,6 +201,7 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "outcomes",
       "evidence",
       "connections",
+      "credentials",
       "resources",
       "webhooks",
       "events",
@@ -179,11 +211,95 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "goals",
     ]),
   ],
+  // WORK-010 §30: /connections is the tenant-scoped connection layer —
+  // downstream infrastructure for tenant access. It consumes the
+  // providers/catalog/projects/auth/credentials public interfaces but
+  // must NEVER import the downstream decision layers or premature
+  // modules.
+  [
+    "connections",
+    new Set([
+      "routing",
+      "optimization",
+      "experiments",
+      "executions",
+      "plans",
+      "strategies",
+      "observations",
+      "outcomes",
+      "evidence",
+      "resources",
+      "webhooks",
+      "events",
+      "audit",
+      "llm",
+      "agents",
+      "goals",
+    ]),
+  ],
+  // WORK-010 §26, §30-§31: /credentials is THE secret boundary — it may
+  // import ONLY @cp/platform (+ node builtins). It must never depend on
+  // any domain module: secret access policy stays isolated from domain
+  // concerns, and no domain import can leak into secret handling.
+  [
+    "credentials",
+    new Set([
+      "auth",
+      "organizations",
+      "projects",
+      "capabilities",
+      "providers",
+      "catalog",
+      "policies",
+      "eligibility",
+      "goals",
+      "plans",
+      "executions",
+      "routing",
+      "optimization",
+      "experiments",
+      "observations",
+      "outcomes",
+      "evidence",
+      "resources",
+      "connections",
+      "webhooks",
+      "events",
+      "audit",
+      "llm",
+      "agents",
+    ]),
+  ],
   // Upstream modules must not import /policies or /eligibility (no
   // cycles): capability semantics, provider identity, catalog facts,
-  // and policy rules are upstream of candidate evaluation.
-  ["capabilities", new Set(["providers", "catalog", "policies", "eligibility"])],
-  ["providers", new Set(["routing", "optimization", "experiments", "catalog", "policies", "eligibility"])],
+  // and policy rules are upstream of candidate evaluation. WORK-010
+  // extends this with /connections (tenant-scoped downstream
+  // infrastructure) and /credentials (the secret boundary — policy,
+  // catalog, eligibility, and capabilities never need secret access:
+  // WORK-010 §38 final authority rule).
+  [
+    "capabilities",
+    new Set([
+      "providers",
+      "catalog",
+      "policies",
+      "eligibility",
+      "connections",
+      "credentials",
+    ]),
+  ],
+  [
+    "providers",
+    new Set([
+      "routing",
+      "optimization",
+      "experiments",
+      "catalog",
+      "policies",
+      "eligibility",
+      "connections",
+    ]),
+  ],
   // WORK-007 §22: /catalog is the normalized marketplace PROJECTION — it
   // consumes capabilities + providers public interfaces and owns only
   // marketplace facts. It must never import the downstream decision
@@ -199,6 +315,7 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "experiments",
       "eligibility",
       "policies",
+      "credentials",
       "plans",
       "strategies",
       "executions",
@@ -330,6 +447,22 @@ function classifyViolation(c, importingModule, file, specifier) {
         message: `/platform must not import module "${targetModule}" (${specifier})`,
       };
     }
+    // (1.5) WORK-010 capability composition entry: importable ONLY by the
+    // composition root. This rule takes priority over the generic
+    // deep-import rule so the trusted file's import is legal while every
+    // other importer (handlers, main, any domain module) is rejected.
+    if (targetModule === "credentials" && isCredentialsCompositionSubpath(subpath)) {
+      if (!isCredentialsCompositionRoot(file)) {
+        return {
+          file,
+          specifier,
+          rule: "credentials-composition-restricted",
+          message:
+            `the credentials capability composition entry (${specifier}) may be imported ONLY by the composition root (${[...CREDENTIALS_COMPOSITION_ROOTS].join(", ")}) — ordinary modules cannot manufacture credential authority`,
+        };
+      }
+      return null; // the trusted composition root may import it.
+    }
     // (2) /api must not import module internals.
     if (importingModule === "api" && isInternal) {
       return {
@@ -399,6 +532,20 @@ function classifyViolation(c, importingModule, file, specifier) {
         rule: "platform-no-domain-imports",
         message: `/platform must not import module "${targetModule}" (${specifier})`,
       };
+    }
+    // (1.5) credentials capability composition entry (relative form):
+    // importable ONLY by the composition root.
+    if (targetModule === "credentials" && isCredentialsCompositionSubpath(sub)) {
+      if (!isCredentialsCompositionRoot(file)) {
+        return {
+          file,
+          specifier,
+          rule: "credentials-composition-restricted",
+          message:
+            `the credentials capability composition entry (reached via ${specifier}) may be imported ONLY by the composition root (${[...CREDENTIALS_COMPOSITION_ROOTS].join(", ")}) — ordinary modules cannot manufacture credential authority`,
+        };
+      }
+      return null;
     }
     // (2) /api must not import module internals.
     if (importingModule === "api" && isInternal) {
