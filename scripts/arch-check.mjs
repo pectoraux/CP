@@ -172,6 +172,7 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "evidence",
       "connections",
       "credentials",
+      "goals",
       "resources",
       "providers",
       "webhooks",
@@ -202,6 +203,7 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "evidence",
       "connections",
       "credentials",
+      "goals",
       "resources",
       "webhooks",
       "events",
@@ -270,13 +272,75 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "agents",
     ]),
   ],
+  // WORK-011 §17, §27: /goals is the customer objective layer — it
+  // consumes platform/auth/projects/outcomes public interfaces and must
+  // never import the policy domain (a SEPARATE semantic: policy = what
+  // must be true; goal = what outcome we want), the provider/catalog
+  // layers, or any downstream decision/execution module.
+  [
+    "goals",
+    new Set([
+      "policies",
+      "providers",
+      "catalog",
+      "eligibility",
+      "routing",
+      "optimization",
+      "experiments",
+      "executions",
+      "plans",
+      "strategies",
+      "observations",
+      "evidence",
+      "connections",
+      "credentials",
+      "resources",
+      "webhooks",
+      "events",
+      "audit",
+      "llm",
+      "agents",
+    ].filter((m) => m !== "outcomes-placeholder")),
+  ],
+  // WORK-011 §27: /outcomes owns the outcome contracts (measurement
+  // definitions). It consumes platform/auth/projects ONLY — it must not
+  // even import /goals (goals reference contracts, not the reverse) nor
+  // any downstream module.
+  [
+    "outcomes",
+    new Set([
+      "goals",
+      "policies",
+      "providers",
+      "catalog",
+      "eligibility",
+      "routing",
+      "optimization",
+      "experiments",
+      "executions",
+      "plans",
+      "strategies",
+      "observations",
+      "evidence",
+      "connections",
+      "credentials",
+      "resources",
+      "webhooks",
+      "events",
+      "audit",
+      "llm",
+      "agents",
+    ]),
+  ],
   // Upstream modules must not import /policies or /eligibility (no
   // cycles): capability semantics, provider identity, catalog facts,
   // and policy rules are upstream of candidate evaluation. WORK-010
   // extends this with /connections (tenant-scoped downstream
   // infrastructure) and /credentials (the secret boundary — policy,
   // catalog, eligibility, and capabilities never need secret access:
-  // WORK-010 §38 final authority rule).
+  // WORK-010 §38 final authority rule). WORK-011 adds /goals and
+  // /outcomes (customer configuration is downstream of the marketplace
+  // and policy layers).
   [
     "capabilities",
     new Set([
@@ -286,6 +350,8 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "eligibility",
       "connections",
       "credentials",
+      "goals",
+      "outcomes",
     ]),
   ],
   [
@@ -298,6 +364,8 @@ const DIRECTIONAL_FORBIDDEN = new Map([
       "policies",
       "eligibility",
       "connections",
+      "goals",
+      "outcomes",
     ]),
   ],
   // WORK-007 §22: /catalog is the normalized marketplace PROJECTION — it
