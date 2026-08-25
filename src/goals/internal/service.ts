@@ -16,16 +16,20 @@
 // concurrent activation is race-safe.
 //
 // VERSION INTEGRITY (the goal ↔ contract reference invariant): a goal
-// version may reference ONLY a PUBLISHED (immutable) outcome-contract
-// version — active or deprecated. Draft contract versions are still
-// mutable (updateDraftContent) and are rejected at goal-version
-// CREATION, so a mutable measurement definition can never back a goal
-// version that can become active; goal-version ACTIVATION defensively
-// re-verifies the reference for rows that bypassed creation validation.
-// The exact immutable version reference — never a copy of the content —
-// is the authority: historical goal versions stay interpretable against
-// the exact contract version they reference, across any later contract
-// versions.
+// version may reference ONLY a PUBLISHED (immutable) and AVAILABLE
+// outcome-contract version — active or deprecated. Draft contract
+// versions are still mutable (updateDraftContent) and retired versions
+// are withdrawn; BOTH gates — goal-version CREATION and goal-version
+// ACTIVATION (a defensive re-verification for rows that bypassed
+// creation validation) — reject draft, retired, and unresolvable
+// references, so neither a mutable nor a withdrawn measurement
+// definition can back a goal version that becomes active. The exact
+// immutable version reference — never a copy of the content — is the
+// authority: historical goal versions stay interpretable against the
+// exact contract version they reference, across later contract
+// versions AND across the later retirement of the referenced version
+// (retirement changes availability for NEW activations, never
+// content — goals that were already active are untouched).
 //
 // NOT implemented (§18, §29): strategy generation, optimization, utility
 // scoring — the objectives are the semantic target future layers
@@ -310,12 +314,13 @@ export class GoalsService {
    * Create a new DRAFT goal version: validated objectives + an EXACT
    * outcome-contract reference. The referenced contract version is
    * resolved through the /outcomes PUBLIC interface (project-scoped):
-   * it must exist, it must be PUBLISHED (immutable — active or
-   * deprecated; draft versions are still mutable and are rejected so
-   * they can never become the measurement definition of an activatable
-   * goal version), and its metric/direction must be compatible with the
-   * objectives (the same measurement space). A semantic change NEVER
-   * overwrites a published version — a new version is the only path.
+   * it must exist, it must be PUBLISHED and AVAILABLE (active or
+   * deprecated — draft versions are still mutable and retired versions
+   * are withdrawn; both are rejected so neither can become the
+   * measurement definition of an activatable goal version), and its
+   * metric/direction must be compatible with the objectives (the same
+   * measurement space). A semantic change NEVER overwrites a published
+   * version — a new version is the only path.
    */
   async createVersion(input: CreateGoalVersionInput): Promise<GoalVersion> {
     await this.requireProjectScope(input.organizationId, input.projectId, input.actingPrincipal, {
@@ -364,6 +369,7 @@ export class GoalsService {
     if (contractVersion.status === "retired") {
       throw policyBlocked("goal.outcome_contract.retired", "a retired outcome contract version cannot be referenced by a new goal version", {
         reason: "contract_version_retired",
+        stage: "creation",
       });
     }
     // Semantic compatibility: every objective's metric must be defined
@@ -489,9 +495,12 @@ export class GoalsService {
   }
 
   /**
-   * Transition a goal version's lifecycle. Activation deprecates the
-   * previous active version within one transaction; concurrent
-   * activations resolve via the partial unique index (one winner).
+   * Transition a goal version's lifecycle. Activation requires the
+   * referenced outcome-contract version to be ACTIVE or DEPRECATED
+   * (published-immutable and still available — draft, retired, and
+   * unresolvable references are rejected) and deprecates the previous
+   * active version within one transaction; concurrent activations
+   * resolve via the partial unique index (one winner).
    */
   async transitionVersion(input: TransitionGoalVersionInput): Promise<GoalVersion> {
     await this.requireProjectScope(input.organizationId, input.projectId, input.actingPrincipal, {
@@ -520,18 +529,23 @@ export class GoalsService {
       });
     }
     if (input.toStatus === "active") {
-      // VERSION INTEGRITY (defensive re-check at activation): the
-      // referenced outcome-contract version must be immutable before a
-      // goal version may become ACTIVE. Creation already rejects draft
-      // references, so this gate should never fire for rows that passed
-      // through createVersion() — it exists as defense in depth for
-      // rows seeded by older code or written behind the service (direct
-      // SQL), and it re-verifies the reference at the moment
-      // immutability semantics actually bind. The contract lifecycle is
-      // one-way (draft → active → deprecated → retired; a published
-      // version can never return to draft), so a reference observed
-      // non-draft here stays immutable forever — the check is sound
-      // under concurrency.
+      // VERSION INTEGRITY (defensive re-check at activation): a goal
+      // version may become ACTIVE only while its referenced
+      // outcome-contract version is ACTIVE or DEPRECATED —
+      // published-immutable AND still available. Draft (still
+      // mutable), retired (withdrawn), and unresolvable references are
+      // ALL rejected — the same rule the creation gate enforces.
+      // Creation already applies it, so this gate should never fire for
+      // rows that passed through createVersion() — it exists as
+      // defense in depth for rows seeded by older code or written
+      // behind the service (direct SQL), and it re-verifies the
+      // reference at the moment activation semantics actually bind.
+      // Goals that are ALREADY active are deliberately untouched: when
+      // a referenced contract version is later retired they keep
+      // interpreting the exact immutable content they referenced —
+      // retirement changes availability for NEW activations, never
+      // historical meaning (the lifecycle is one-way and retirement
+      // never mutates content).
       const referenced = await this.outcomes.getVersion(
         input.organizationId,
         input.projectId,
@@ -557,6 +571,18 @@ export class GoalsService {
           `outcome contract "${existing.outcomeContractId}" version "${existing.outcomeContractVersion}" is still draft and mutable — publish the contract version before activating this goal version`,
           {
             reason: "contract_version_mutable",
+            stage: "activation",
+            outcome_contract_id: existing.outcomeContractId,
+            outcome_contract_version: existing.outcomeContractVersion,
+          },
+        );
+      }
+      if (referenced.status === "retired") {
+        throw policyBlocked(
+          "goal.outcome_contract.retired",
+          `outcome contract "${existing.outcomeContractId}" version "${existing.outcomeContractVersion}" is retired — a goal version may not become active on a withdrawn measurement definition (goals that were already active keep interpreting the exact retired content)`,
+          {
+            reason: "contract_version_retired",
             stage: "activation",
             outcome_contract_id: existing.outcomeContractId,
             outcome_contract_version: existing.outcomeContractVersion,

@@ -388,7 +388,7 @@ describe("WORK-011 goals + objectives (real PostgreSQL)", () => {
     });
   });
 
-  it("VERSION INTEGRITY: a draft contract cannot back an activatable goal version; published contracts pin immutable semantics", async () => {
+  it("VERSION INTEGRITY activation reference matrix: draft rejected, retired rejected, active succeeds, deprecated succeeds; retired contracts never mutate content or disturb active goals", async () => {
     await withInfra(async (handle) => {
       const ctx = await setup(handle);
       try {
@@ -432,11 +432,11 @@ describe("WORK-011 goals + objectives (real PostgreSQL)", () => {
         expect(gv1.version).toBe("1");
         expect(gv1.status).toBe("draft");
 
-        // (3) Defensive ACTIVATION gate: a goal-version row referencing a
-        // DRAFT contract version (only reachable by bypassing
-        // createVersion — direct SQL, as a legacy/pre-fix row would be)
-        // cannot be activated. Seeded on a SEPARATE goal so it does not
-        // disturb this goal's version numbering.
+        // (3) MATRIX ROW — ACTIVATION / DRAFT: rejected. A goal-version
+        // row referencing a DRAFT contract version (only reachable by
+        // bypassing createVersion — direct SQL, as a legacy/pre-fix row
+        // would be) cannot be activated. Seeded on a SEPARATE goal so it
+        // does not disturb this goal's version numbering.
         const draftContract = await ctx.outcomes.createContract({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
           name: "latency", content: LATENCY_CONTRACT, actingPrincipal: tenant.adminP,
@@ -473,9 +473,11 @@ describe("WORK-011 goals + objectives (real PostgreSQL)", () => {
         );
         expect(seeded?.status).toBe("draft");
 
-        // (4) Activate the goal version: the referenced (published)
-        // contract version can NO LONGER be modified through any path —
-        // the ACTIVE goal's measurement semantics are pinned.
+        // (4) MATRIX ROW — ACTIVATION / ACTIVE: succeeds. Activate the
+        // goal version over the ACTIVE contract reference; the
+        // referenced (published) contract version can NO LONGER be
+        // modified through any path — the ACTIVE goal's measurement
+        // semantics are pinned.
         await ctx.goals.transitionVersion({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
           goalId: goal.id, version: "1", toStatus: "active", actingPrincipal: tenant.adminP,
@@ -513,9 +515,10 @@ describe("WORK-011 goals + objectives (real PostgreSQL)", () => {
           }),
         );
 
-        // (6) DEPRECATED contract versions are published-immutable and
-        // remain VALID references (the frozen one-way lifecycle: active
-        // and deprecated are both immutable; only draft is mutable).
+        // (6) MATRIX ROW — ACTIVATION / DEPRECATED: succeeds. Deprecated
+        // contract versions are published-immutable and remain VALID
+        // references (the frozen one-way lifecycle: active and deprecated
+        // are both immutable; only draft is mutable).
         const gv2 = await ctx.goals.createVersion({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
           goalId: goal.id,
@@ -543,9 +546,44 @@ describe("WORK-011 goals + objectives (real PostgreSQL)", () => {
         expect(deprecatedGoalVersion?.status).toBe("deprecated");
         expect(deprecatedGoalVersion?.outcomeContractVersion).toBe("1");
 
-        // (7) RETIRED contract versions are rejected for NEW goal
-        // versions (terminal, unavailable measurement definition).
-        await refVersion("retired", contract.contractId, "2");
+        // (6b) MATRIX ROW — ACTIVATION / RETIRED: rejected. The exact
+        // path from the review, entirely through public interfaces: a
+        // goal version CREATED while its referenced contract version
+        // was ACTIVE (valid at creation) can NO LONGER be activated
+        // once that contract version retires — a goal version may not
+        // newly become ACTIVE on a withdrawn measurement definition.
+        // Contract v2 is ACTIVE at this point (v1 deprecated).
+        const gv3 = await ctx.goals.createVersion({
+          organizationId: tenant.organizationId, projectId: tenant.projectId,
+          goalId: goal.id,
+          objectives: [{ direction: "maximize", metric: "success_rate", kind: "hard", target: 0.98 }],
+          outcomeContractId: contract.contractId,
+          outcomeContractVersion: "2",
+          actingPrincipal: tenant.adminP,
+        });
+        expect(gv3.version).toBe("3");
+        expect(gv3.status).toBe("draft");
+        await refVersion("retired", contract.contractId, "2"); // active → retired
+        let retiredActivationError: AppError | null = null;
+        try {
+          await ctx.goals.transitionVersion({
+            organizationId: tenant.organizationId, projectId: tenant.projectId,
+            goalId: goal.id, version: "3", toStatus: "active", actingPrincipal: tenant.adminP,
+          });
+        } catch (err) {
+          retiredActivationError = err as AppError;
+        }
+        expect(retiredActivationError).not.toBeNull();
+        expect(retiredActivationError!.code).toBe("goal.outcome_contract.retired");
+        expect((retiredActivationError!.details as Record<string, unknown>).stage).toBe("activation");
+        // Nothing partially applied — the goal version is still draft.
+        const gv3After = await ctx.goals.getVersion(
+          tenant.organizationId, tenant.projectId, goal.id, "3", tenant.adminP,
+        );
+        expect(gv3After?.status).toBe("draft");
+
+        // (7) RETIRED contract versions are ALSO rejected for NEW goal
+        // versions at creation (v2 is now retired).
         await expectRejected("goal.outcome_contract.retired", () =>
           ctx.goals.createVersion({
             organizationId: tenant.organizationId, projectId: tenant.projectId,
@@ -554,6 +592,35 @@ describe("WORK-011 goals + objectives (real PostgreSQL)", () => {
             outcomeContractId: contract.contractId,
             outcomeContractVersion: "2",
             actingPrincipal: tenant.adminP,
+          }),
+        );
+
+        // (8) HISTORICAL INTEGRITY THROUGH RETIREMENT: an ALREADY-active
+        // goal whose referenced contract version is later retired stays
+        // active and interpretable. Retirement changes availability for
+        // NEW activations only — it must NOT mutate the contract's
+        // content, and it must NOT disturb the active goal. The active
+        // goal (v2) references contract version 1; retire it now.
+        await refVersion("retired", contract.contractId, "1"); // deprecated → retired
+        const stillActiveGoal = await ctx.goals.getActiveVersion(
+          tenant.organizationId, tenant.projectId, goal.id, tenant.memberP,
+        );
+        expect(stillActiveGoal?.version).toBe("2");
+        expect(stillActiveGoal?.outcomeContractVersion).toBe("1");
+        // The reference still resolves to the EXACT original content —
+        // retirement changed the status, never the semantics.
+        const retiredRef = await ctx.outcomes.getVersion(
+          tenant.organizationId, tenant.projectId, contract.contractId, "1", tenant.adminP,
+        );
+        expect(retiredRef?.status).toBe("retired");
+        expect(retiredRef?.content.threshold).toBe(0.99);
+        expect(retiredRef?.content.metric).toBe("success_rate");
+        // Retirement did not make the version mutable either.
+        await expectRejected("outcome.contract.version.immutable", () =>
+          ctx.outcomes.updateDraftContent({
+            organizationId: tenant.organizationId, projectId: tenant.projectId,
+            contractId: contract.contractId, version: "1",
+            content: SUCCESS_CONTRACT, actingPrincipal: tenant.adminP,
           }),
         );
       } finally {

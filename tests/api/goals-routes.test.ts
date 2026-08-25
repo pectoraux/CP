@@ -180,6 +180,46 @@ describe("WORK-011 goals + outcome contracts routes (real PG, in-app)", () => {
         expect(gact.status).toBe(200);
         expect(((await gact.json()) as { version: { status: string } }).version.status).toBe("active");
 
+        // 4b. VERSION INTEGRITY over HTTP (retired at activation): a goal
+        // version created while its referenced contract version was
+        // ACTIVE can no longer be activated once that contract version
+        // retires — structured 403 with the stage detail.
+        const rc = await app.request(`${base}/outcome-contracts`, {
+          method: "POST", headers: auth,
+          body: JSON.stringify({ name: "retire-test", content: SUCCESS_CONTRACT }),
+        });
+        expect(rc.status).toBe(201);
+        const rcv = ((await rc.json()) as { contract_version: { contract_id: string } }).contract_version;
+        const ract = await app.request(`${base}/outcome-contracts/${rcv.contract_id}/versions/1/lifecycle`, {
+          method: "POST", headers: auth, body: JSON.stringify({ status: "active" }),
+        });
+        expect(ract.status).toBe(200);
+        const rgv = await app.request(`${base}/goals/${goal.id}/versions`, {
+          method: "POST", headers: auth,
+          body: JSON.stringify({
+            objectives: [{ direction: "maximize", metric: "success_rate", kind: "hard" }],
+            outcome_contract_id: rcv.contract_id,
+            outcome_contract_version: "1",
+          }),
+        });
+        expect(rgv.status).toBe(201);
+        const rretire = await app.request(`${base}/outcome-contracts/${rcv.contract_id}/versions/1/lifecycle`, {
+          method: "POST", headers: auth, body: JSON.stringify({ status: "retired" }),
+        });
+        expect(rretire.status).toBe(200);
+        const rgact = await app.request(`${base}/goals/${goal.id}/versions/2/lifecycle`, {
+          method: "POST", headers: auth, body: JSON.stringify({ status: "active" }),
+        });
+        expect(rgact.status).toBe(403);
+        const rgactBody = (await rgact.json()) as { error: { code: string; details?: { stage?: string } } };
+        expect(rgactBody.error.code).toBe("goal.outcome_contract.retired");
+        expect(rgactBody.error.details?.stage).toBe("activation");
+        // The blocked version is still draft (nothing partially applied).
+        const rgvGet = await app.request(`${base}/goals/${goal.id}/versions/2`, {
+          headers: { authorization: `Bearer ${tenant.ownerKey}` },
+        });
+        expect(((await rgvGet.json()) as { version: { status: string } }).version.status).toBe("draft");
+
         // 5. Member can read; cannot mutate.
         const memberAuth = { "content-type": "application/json", authorization: `Bearer ${tenant.memberKey}` };
         const list = await app.request(`${base}/goals?limit=10`, { headers: { authorization: `Bearer ${tenant.memberKey}` } });

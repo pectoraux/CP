@@ -339,8 +339,10 @@ export class OutcomesService {
    * against the exact contract version they reference, and an ACTIVE
    * goal's measurement semantics can never change underneath it. A
    * contract version referenced by a goal version must therefore be
-   * published (see GoalsService's creation/activation gates) before it
-   * can carry that role; from then on this method refuses it.
+   * published and still available (active or deprecated — see
+   * GoalsService's creation/activation gates) before it can carry that
+   * role; from then on this method refuses it, before AND after
+   * retirement.
    */
   async updateDraftContent(input: UpdateDraftContentInput): Promise<OutcomeContractVersion> {
     await this.requireProjectScope(input.organizationId, input.projectId, input.actingPrincipal, {

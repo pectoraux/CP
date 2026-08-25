@@ -15,14 +15,15 @@
 //     entries; hard targets and soft preferences are explicitly
 //     distinguished (paralleling but NOT coupled to WORK-008)
 //   - EXACT outcome-contract references with VERSION INTEGRITY: every
-//     goal version names a PUBLISHED (immutable) /outcomes contract
-//     version — active or deprecated; draft (still-mutable) versions
-//     are rejected at creation and re-checked defensively at
-//     activation — semantically compatible with its objectives (the
-//     same metric/direction measurement space). The exact immutable
-//     version reference is the authority (never a content copy):
-//     historical goal versions remain interpretable forever, across
-//     any later contract versions
+//     goal version names a PUBLISHED and AVAILABLE /outcomes contract
+//     version — active or deprecated; draft (still-mutable) and
+//     retired (withdrawn) versions are rejected at creation AND
+//     re-checked defensively at activation — semantically compatible
+//     with its objectives (the same metric/direction measurement
+//     space). The exact immutable version reference is the authority
+//     (never a content copy): historical goal versions remain
+//     interpretable forever, across later contract versions and across
+//     the later retirement of the referenced version
 //   - the draft → active → deprecated → retired lifecycle with the
 //     authoritative at-most-one-active invariant (partial unique index;
 //     activation auto-deprecates the previous active version)
