@@ -341,20 +341,21 @@ describe("ConnectionsService (real PostgreSQL + real Minio)", () => {
         expect(second.id).toBe(conn.id);
         expect(second.credentialId).not.toBe(firstCredId);
         expect(second.credentialConfigured).toBe(true);
-        // The OLD credential is revoked (never resolvable).
+        // The OLD credential is revoked (never resolvable — even through
+        // the adapter resolver capability).
         const oldMeta = await ctx.credentials.getMetadata(tenant.projectId, firstCredId);
         expect(oldMeta?.status).toBe("revoked");
-        const grant = ctx.credentials.issueAdapterGrant();
         await expectRejected("credential.revoked", () =>
-          ctx.credentials.resolveForAdapter({
+          ctx.adapterResolver.resolve({
             organizationId: tenant.organizationId, projectId: tenant.projectId,
-            credentialId: firstCredId, grant,
+            credentialId: firstCredId,
           }),
         );
-        // The NEW credential resolves.
-        const resolved = await ctx.credentials.resolveForAdapter({
+        // The NEW credential resolves via the adapter resolver capability
+        // (the ONLY path that returns secret material).
+        const resolved = await ctx.adapterResolver.resolve({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
-          credentialId: second.credentialId!, grant,
+          credentialId: second.credentialId!,
         });
         expect(resolved.value).toBe("second-secret");
       } finally {

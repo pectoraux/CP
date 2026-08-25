@@ -25,6 +25,14 @@
 // never raw table SQL for other modules' data). This module's SQL touches
 // ONLY cp_connections.
 //
+// CREDENTIAL CAPABILITIES (architect review of PR #9): this layer holds
+// the metadata-only CredentialsService (safe reads) PLUS the separately
+// injected CredentialMutationAuthority — a frozen capability object that
+// exists ONLY via createCredentialsBoundary() and is handed here by the
+// composition root. It never holds the adapter RESOLUTION capability
+// (reserved for the future execution seam), and every mutation call is
+// preceded by this service's tenant + admin/owner authorization.
+//
 // TENANCY (§18): every operation takes the AUTHORIZED (organizationId,
 // projectId) pair resolved by the /api org/project middlewares and
 // re-verifies server-side (active membership + project ∈ org via the
@@ -50,7 +58,11 @@ import { activeMembershipIn } from "@cp/auth";
 import type { ProjectsService } from "@cp/projects";
 import type { CapabilitiesService } from "@cp/capabilities";
 import type { ProvidersService } from "@cp/providers";
-import type { CredentialsService, CredentialMetadata } from "@cp/credentials";
+import type {
+  CredentialsService,
+  CredentialMutationAuthority,
+  CredentialMetadata,
+} from "@cp/credentials";
 
 // ---- Lifecycle (WORK-010 §4) ------------------------------------------------
 
@@ -189,7 +201,17 @@ export interface ConnectionsServiceOptions {
   projects: ProjectsService;
   capabilities: CapabilitiesService;
   providers: ProvidersService;
+  /** Metadata-only credential reads (safe surface). */
   credentials: CredentialsService;
+  /**
+   * The credential MUTATION capability (create/replace/revoke) — a
+   * separate, frozen authority object handed to this layer by the
+   * composition root (architect review of PR #9). Every call is
+   * preceded by this service's tenant + admin/owner authorization, so
+   * the connection authorization boundary cannot be bypassed by holders
+   * of the metadata-only service.
+   */
+  credentialMutations: CredentialMutationAuthority;
 }
 
 const NOOP_SINK: LogSink = {
@@ -212,6 +234,7 @@ export class ConnectionsService {
   private readonly capabilities: CapabilitiesService;
   private readonly providers: ProvidersService;
   private readonly credentials: CredentialsService;
+  private readonly credentialMutations: CredentialMutationAuthority;
 
   constructor(opts: ConnectionsServiceOptions) {
     this.db = opts.db;
@@ -220,6 +243,7 @@ export class ConnectionsService {
     this.capabilities = opts.capabilities;
     this.providers = opts.providers;
     this.credentials = opts.credentials;
+    this.credentialMutations = opts.credentialMutations;
   }
 
   // ---- Tenancy + authorization (§18) ------------------------------------------
@@ -603,7 +627,7 @@ export class ConnectionsService {
         }
       }
     }
-    const credential = await this.credentials.createCredential({
+    const credential = await this.credentialMutations.createCredential({
       organizationId: input.organizationId,
       projectId: input.projectId,
       kind: input.kind as never,
@@ -620,7 +644,7 @@ export class ConnectionsService {
     // switched — the old secret cannot be resurrected and the connection
     // identity stayed stable.
     if (existing.credentialId && existing.credentialId !== credential.id) {
-      await this.credentials.revokeCredential({
+      await this.credentialMutations.revokeCredential({
         organizationId: input.organizationId,
         projectId: input.projectId,
         credentialId: existing.credentialId,
@@ -662,7 +686,7 @@ export class ConnectionsService {
         reason: "no_credential",
       });
     }
-    await this.credentials.revokeCredential({
+    await this.credentialMutations.revokeCredential({
       organizationId: input.organizationId,
       projectId: input.projectId,
       credentialId: existing.credentialId,

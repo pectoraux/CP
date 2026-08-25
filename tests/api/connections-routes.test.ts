@@ -168,6 +168,17 @@ describe("WORK-010 connection routes (real PG + real Minio, in-app)", () => {
     await withInfra(async (handle) => {
       const { app, api, db, sink, cleanup } = await setup(handle);
       try {
+        // WORK-010 capability boundary (architect review of PR #9): the
+        // Api surface exposes NO credential capability of any kind — no
+        // metadata service, no mutation authority, and critically NO
+        // adapter resolver. Ordinary request-handling code structurally
+        // cannot reach secret-resolution authority.
+        const apiSurface = api as unknown as Record<string, unknown>;
+        expect(apiSurface.credentials).toBeUndefined();
+        expect(apiSurface.credentialMutations).toBeUndefined();
+        expect(apiSurface.adapterResolver).toBeUndefined();
+        expect(apiSurface.credentialsBoundary).toBeUndefined();
+
         const t = `${Date.now()}`;
         const tenant = await makeTenant(app, t);
         // Bootstrap the capability admin FIRST (the catalog mutations in

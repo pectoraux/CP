@@ -35,6 +35,14 @@ describe("WORK-010 real-socket connections smoke", () => {
         port, hostname: "127.0.0.1", db, storage, autoMigrate: true,
       });
       try {
+        // WORK-010 capability boundary (architect review of PR #9): the
+        // served Api exposes NO credential capability — ordinary code
+        // cannot reach secret-resolution authority.
+        const apiSurface = api as unknown as Record<string, unknown>;
+        expect(apiSurface.credentials).toBeUndefined();
+        expect(apiSurface.credentialMutations).toBeUndefined();
+        expect(apiSurface.adapterResolver).toBeUndefined();
+
         const t = Date.now();
         const req = (
           path: string,

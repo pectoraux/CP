@@ -1,7 +1,7 @@
 // /credentials/internal/service.ts
-// CredentialsService — the /credentials module's concrete service
-// (WORK-010, architecture §2.17, §30, §36; lock §10; frozen CONN/CRED
-// requirements). THE secret-access boundary of the platform:
+// The /credentials module's concrete implementation (WORK-010, architecture
+// §2.17, §30, §36; lock §10; frozen CONN/CRED requirements). THE
+// secret-access boundary of the platform:
 //
 //   CredentialMetadata (PostgreSQL)  ≠  SecretMaterial (encrypted blob
 //                                       in platform ObjectStorage)
@@ -10,20 +10,44 @@
 //   /platform owns the generic storage infrastructure. The physical
 //   storage mechanism stays behind this boundary (WORK-010 §26).
 //
+// RUNTIME CAPABILITY BOUNDARY (architect review of PR #9):
+//   The previous design exposed a publicly callable grant-minting method
+//   (issueAdapterGrant) whose TypeScript brand is erased at runtime — any
+//   code holding the service instance could mint the "grant" and resolve
+//   raw secrets. That flaw is corrected with OBJECT-CAPABILITY ownership:
+//
+//   - CredentialsService is METADATA-ONLY (getMetadata / listCredentials).
+//     It has NO mutation and NO resolution methods — there is nothing to
+//     call, so holding it grants nothing beyond safe metadata reads.
+//
+//   - Credential mutation authority (create / replace / revoke) and
+//     adapter-boundary resolution authority each exist as SEPARATE,
+//     FROZEN capability objects:
+//
+//         createCredentialsBoundary(opts)
+//              ↓ (the single construction entry — the composition root)
+//         { service, mutationAuthority, adapterResolver }
+//
+//     The composition root hands `service` + `mutationAuthority` to the
+//     /connections layer and reserves `adapterResolver` for the future
+//     execution/provider-adapter seam (WORK-014), which RECEIVES it by
+//     injection. There is NO minting method anywhere in the codebase: no
+//     method on any distributed object can produce a new authority. The
+//     authority IS the object reference; security is enforced by runtime
+//     object ownership (references propagate ONLY via explicit
+//     injection from the composition root) — not by a TypeScript brand.
+//
+//   - The capability objects are Object.freeze'd: methods cannot be
+//     swapped or extended at runtime.
+//
 // SECRET BOUNDARY (§6-§10, §31):
 //   - Connection rows store only a credential REFERENCE (id) — never
 //     api keys, secrets, passwords, private keys, or OAuth tokens.
 //   - Secret material is encrypted (AES-256-GCM, HKDF-derived
 //     per-record key, deployment master key) and stored in the platform
 //     ObjectStorage at credentials/{id}/v{n} — never in PostgreSQL.
-//   - resolveForAdapter() is the ONLY path that returns a secret value,
-//     and it requires an AdapterCredentialGrant — a branded token
-//     reserved for the future execution/provider-adapter integration
-//     seam (architecture §30: "adapters must receive only the
-//     credentials/scopes required for their provider operation").
-//     There is deliberately NO HTTP endpoint that resolves secrets and
-//     NO list/get helper returning values.
-//   - Revoked credentials never resolve. Rotation (replaceSecret)
+//   - adapterResolver.resolve() is the ONLY path that returns a secret
+//     value. Revoked credentials never resolve. Rotation (replaceSecret)
 //     writes a NEW encrypted version and deletes the old blob — old
 //     versions cannot be resurrected.
 //
@@ -75,17 +99,6 @@ export interface ResolvedSecret {
   value: string;
 }
 
-/**
- * A branded authorization token for the execution/provider-adapter seam.
- * Constructible ONLY via CredentialsService.issueAdapterGrant() — the
- * single, explicit integration point the future execution layer
- * (WORK-014) uses. Ordinary domain code, /api handlers, and API clients
- * can never produce one, so they can never resolve secret material.
- */
-export interface AdapterCredentialGrant {
-  readonly __adapterCredentialGrant: unique symbol;
-}
-
 export interface CreateCredentialInput {
   organizationId: string; // authorized org (resolved by the caller)
   projectId: string; // authorized project (project ∈ org, verified by caller)
@@ -114,7 +127,6 @@ export interface ResolveCredentialInput {
   organizationId: string;
   projectId: string;
   credentialId: string;
-  grant: AdapterCredentialGrant;
 }
 
 export interface ListCredentialsOptions {
@@ -128,13 +140,81 @@ export interface CredentialPage {
   nextCursor: string | null;
 }
 
-export interface CredentialsServiceOptions {
+/**
+ * The METADATA-ONLY service surface. Holding a CredentialsService
+ * reference grants exactly: project-scoped metadata reads. There is NO
+ * mutation method and NO resolution method on this class — by design
+ * (architect review of PR #9): the old grant-minting method is gone, and
+ * mutation/resolution authority exists only as separate capability
+ * objects handed out by createCredentialsBoundary().
+ */
+export class CredentialsService {
+  private readonly core: CredentialsCore;
+
+  /** @internal — construct via createCredentialsBoundary(). */
+  constructor(core: CredentialsCore) {
+    this.core = core;
+  }
+
+  async getMetadata(projectId: string, credentialId: string): Promise<CredentialMetadata | null> {
+    return getMetadata(this.core, projectId, credentialId);
+  }
+
+  async listCredentials(
+    projectId: string,
+    opts: ListCredentialsOptions = {},
+  ): Promise<CredentialPage> {
+    return listCredentials(this.core, projectId, opts);
+  }
+}
+
+/**
+ * Credential MUTATION authority: create / rotate (replace) / revoke.
+ * Handed out ONLY by createCredentialsBoundary(); the composition root
+ * injects it into the /connections layer (which performs the tenant
+ * authorization before every call). Frozen at runtime.
+ */
+export interface CredentialMutationAuthority {
+  createCredential(input: CreateCredentialInput): Promise<CredentialMetadata>;
+  replaceSecret(input: ReplaceSecretInput): Promise<CredentialMetadata>;
+  revokeCredential(input: RevokeCredentialInput): Promise<CredentialMetadata>;
+}
+
+/**
+ * The RUNTIME capability for the execution/provider-adapter seam: the
+ * ONLY object in the system that can resolve secret material. Received
+ * by injection (WORK-014's execution layer will be handed this object at
+ * composition); there is no way to mint, derive, or otherwise obtain
+ * one except by being given the reference. Frozen at runtime.
+ */
+export interface AdapterCredentialResolver {
+  resolve(input: ResolveCredentialInput): Promise<ResolvedSecret>;
+}
+
+/** The full construction result — the single capability distribution point. */
+export interface CredentialsBoundary {
+  /** Metadata-only reads. */
+  service: CredentialsService;
+  /** Create/replace/revoke — inject into the connection layer. */
+  mutationAuthority: CredentialMutationAuthority;
+  /** Secret resolution — reserve for the execution/provider-adapter seam. */
+  adapterResolver: AdapterCredentialResolver;
+}
+
+export interface CredentialsBoundaryOptions {
   db: Database;
   /** The platform object-storage boundary (real S3-compatible storage). */
   storage: ObjectStorage;
   /** 32-byte master key (hex). Defaults to CP_CREDENTIAL_MASTER_KEY. */
   masterKeyHex?: string;
   logger?: Logger;
+}
+
+interface CredentialsCore {
+  db: Database;
+  storage: ObjectStorage;
+  masterKey: Buffer | null;
+  logger: Logger;
 }
 
 const MAX_SECRET_BYTES = 64 * 1024; // 64 KiB
@@ -145,260 +225,287 @@ const NOOP_SINK: LogSink = {
   emit(_record: LogRecord): void {},
 };
 
-// ---- Service ----------------------------------------------------------------
+// ---- The capability distribution point --------------------------------------
 
-export class CredentialsService {
-  private readonly db: Database;
-  private readonly storage: ObjectStorage;
-  private readonly masterKey: Buffer | null;
-  private readonly logger: Logger;
+/**
+ * Construct the credentials boundary: the metadata service + the two
+ * frozen capability objects. This is the SINGLE construction entry and
+ * the composition root's capability distribution point:
+ *
+ *   - `service` + `mutationAuthority` are injected into /connections;
+ *   - `adapterResolver` is RESERVED for the future execution/provider-
+ *     adapter seam (WORK-014), which RECEIVES it by injection.
+ *
+ * There is no other way to obtain any of these objects, and no method on
+ * any of them can mint further authority (architect review of PR #9: the
+ * runtime secret-resolution authority is object ownership, not a
+ * TypeScript brand).
+ */
+export function createCredentialsBoundary(opts: CredentialsBoundaryOptions): CredentialsBoundary {
+  const core: CredentialsCore = {
+    db: opts.db,
+    storage: opts.storage,
+    masterKey: parseMasterKey(opts.masterKeyHex ?? process.env.CP_CREDENTIAL_MASTER_KEY),
+    logger: opts.logger ?? new Logger({ sink: NOOP_SINK, level: "warn" }),
+  };
+  const service = new CredentialsService(core);
+  const mutationAuthority: CredentialMutationAuthority = Object.freeze({
+    createCredential: (input: CreateCredentialInput) => createCredential(core, input),
+    replaceSecret: (input: ReplaceSecretInput) => replaceSecret(core, input),
+    revokeCredential: (input: RevokeCredentialInput) => revokeCredential(core, input),
+  });
+  const adapterResolver: AdapterCredentialResolver = Object.freeze({
+    resolve: (input: ResolveCredentialInput) => resolveForAdapter(core, input),
+  });
+  return Object.freeze({ service, mutationAuthority, adapterResolver });
+}
 
-  constructor(opts: CredentialsServiceOptions) {
-    this.db = opts.db;
-    this.storage = opts.storage;
-    this.masterKey = parseMasterKey(opts.masterKeyHex ?? process.env.CP_CREDENTIAL_MASTER_KEY);
-    this.logger = opts.logger ?? new Logger({ sink: NOOP_SINK, level: "warn" });
-  }
+// ---- Mutation (module-private: reachable ONLY via the mutation capability) ----
 
-  // ---- The adapter-boundary grant (§8, §31) --------------------------------
-
-  /**
-   * Issue the AdapterCredentialGrant — the ONLY constructor of the
-   * branded token, reserved for the future execution/provider-adapter
-   * integration seam. It takes no arguments on purpose: the point is a
-   * single, greppable call site the architect can audit, not a
-   * privilege check. Ordinary request handling must never call this.
-   */
-  issueAdapterGrant(): AdapterCredentialGrant {
-    return { __adapterCredentialGrant: undefined } as unknown as AdapterCredentialGrant;
-  }
-
-  // ---- Create / rotate / revoke ---------------------------------------------
-
-  /**
-   * Create a tenant-scoped credential: metadata row in PostgreSQL +
-   * encrypted secret blob in object storage. The secret parameter is
-   * consumed here and NEVER persisted in any table, log, or response.
-   */
-  async createCredential(input: CreateCredentialInput): Promise<CredentialMetadata> {
-    const kind = validateKind(input.kind);
-    const name = validateName(input.name);
-    validateSecret(input.secret);
-    const id = `cred_${ulid()}`;
-    const blob = encryptSecret(this.masterKey, id, input.secret);
-    // Write the encrypted blob FIRST; the metadata row references a
-    // credential whose secret already exists at version 1.
-    await this.storage.put({
-      key: this.storageKey(id, 1),
-      body: Buffer.from(blob, "utf8"),
-      contentType: "application/octet-stream",
+/**
+ * Create a tenant-scoped credential: metadata row in PostgreSQL +
+ * encrypted secret blob in object storage. The secret parameter is
+ * consumed here and NEVER persisted in any table, log, or response.
+ */
+async function createCredential(
+  core: CredentialsCore,
+  input: CreateCredentialInput,
+): Promise<CredentialMetadata> {
+  const kind = validateKind(input.kind);
+  const name = validateName(input.name);
+  validateSecret(input.secret);
+  const id = `cred_${ulid()}`;
+  const blob = encryptSecret(core.masterKey, id, input.secret);
+  // Write the encrypted blob FIRST; the metadata row references a
+  // credential whose secret already exists at version 1.
+  await core.storage.put({
+    key: storageKey(id, 1),
+    body: Buffer.from(blob, "utf8"),
+    contentType: "application/octet-stream",
+  });
+  try {
+    await core.db.exec({
+      text: `INSERT INTO cp_credentials
+               (id, project_id, kind, name, status, current_version, created_by_user_id)
+             VALUES ($1, $2, $3, $4, 'active', 1, $5)`,
+      params: [id, input.projectId, kind, name, input.actingPrincipal.userId],
     });
-    try {
-      await this.db.exec({
-        text: `INSERT INTO cp_credentials
-                 (id, project_id, kind, name, status, current_version, created_by_user_id)
-               VALUES ($1, $2, $3, $4, 'active', 1, $5)`,
-        params: [id, input.projectId, kind, name, input.actingPrincipal.userId],
-      });
-    } catch (err) {
-      // Metadata insert failed (duplicate name?) — remove the orphaned
-      // blob so no secret material outlives its metadata row.
-      await this.storage.delete(this.storageKey(id, 1)).catch(() => {});
-      if (isUniqueViolation(err)) {
-        throw policyBlocked("credential.duplicate", "a credential with this name already exists in this project", {
-          reason: "duplicate_name",
-        });
-      }
-      throw err;
-    }
-    this.logger.info("credentials: created", {
-      credential_id: id,
-      kind,
-      project_id: input.projectId,
-      organization_id: input.organizationId,
-      user_id: input.actingPrincipal.userId,
-      // NEVER the secret, its length, or any derived hash.
-    });
-    return this.requireMetadata(input.projectId, id);
-  }
-
-  /**
-   * Rotate the secret: write a NEW encrypted version and delete the old
-   * blob within one operation — the credential identity stays stable
-   * (WORK-010 §22). Old versions cannot be resurrected: the resolver
-   * reads only current_version, and the previous blob is deleted.
-   */
-  async replaceSecret(input: ReplaceSecretInput): Promise<CredentialMetadata> {
-    const existing = await this.getMetadata(input.projectId, input.credentialId);
-    if (!existing) {
-      throw notFound("credential.not_found", "the credential was not found in this project");
-    }
-    if (existing.status === "revoked") {
-      throw policyBlocked("credential.revoked", "a revoked credential cannot be replaced — create a new credential", {
-        reason: "credential_revoked",
-        credential_id: input.credentialId,
+  } catch (err) {
+    // Metadata insert failed (duplicate name?) — remove the orphaned
+    // blob so no secret material outlives its metadata row.
+    await core.storage.delete(storageKey(id, 1)).catch(() => {});
+    if (isUniqueViolation(err)) {
+      throw policyBlocked("credential.duplicate", "a credential with this name already exists in this project", {
+        reason: "duplicate_name",
       });
     }
-    validateSecret(input.secret);
-    const newVersion = existing.currentVersion + 1;
-    const blob = encryptSecret(this.masterKey, input.credentialId, input.secret);
-    // Write-then-switch: the new blob exists before current_version
-    // points at it; then the old blob is deleted so it can never be
-    // resolved again (concurrent resolvers reading the old version fail
-    // closed via the version check + missing blob).
-    await this.storage.put({
-      key: this.storageKey(input.credentialId, newVersion),
-      body: Buffer.from(blob, "utf8"),
-      contentType: "application/octet-stream",
-    });
-    await this.db.exec({
-      text: `UPDATE cp_credentials
-             SET current_version = $1, updated_at = NOW()
-             WHERE id = $2 AND project_id = $3 AND status = 'active'`,
-      params: [newVersion, input.credentialId, input.projectId],
-    });
-    if (existing.currentVersion >= 1) {
-      await this.storage.delete(this.storageKey(input.credentialId, existing.currentVersion)).catch(() => {});
-    }
-    this.logger.info("credentials: secret replaced (rotated)", {
+    throw err;
+  }
+  core.logger.info("credentials: created", {
+    credential_id: id,
+    kind,
+    project_id: input.projectId,
+    organization_id: input.organizationId,
+    user_id: input.actingPrincipal.userId,
+    // NEVER the secret, its length, or any derived hash.
+  });
+  return requireMetadata(core, input.projectId, id);
+}
+
+/**
+ * Rotate the secret: write a NEW encrypted version and delete the old
+ * blob within one operation — the credential identity stays stable
+ * (WORK-010 §22). Old versions cannot be resurrected: the resolver
+ * reads only current_version, and the previous blob is deleted.
+ */
+async function replaceSecret(
+  core: CredentialsCore,
+  input: ReplaceSecretInput,
+): Promise<CredentialMetadata> {
+  const existing = await getMetadata(core, input.projectId, input.credentialId);
+  if (!existing) {
+    throw notFound("credential.not_found", "the credential was not found in this project");
+  }
+  if (existing.status === "revoked") {
+    throw policyBlocked("credential.revoked", "a revoked credential cannot be replaced — create a new credential", {
+      reason: "credential_revoked",
       credential_id: input.credentialId,
-      new_version: newVersion,
-      project_id: input.projectId,
-      organization_id: input.organizationId,
-      user_id: input.actingPrincipal.userId,
     });
-    return this.requireMetadata(input.projectId, input.credentialId);
   }
+  validateSecret(input.secret);
+  const newVersion = existing.currentVersion + 1;
+  const blob = encryptSecret(core.masterKey, input.credentialId, input.secret);
+  // Write-then-switch: the new blob exists before current_version
+  // points at it; then the old blob is deleted so it can never be
+  // resolved again (concurrent resolvers reading the old version fail
+  // closed via the version check + missing blob).
+  await core.storage.put({
+    key: storageKey(input.credentialId, newVersion),
+    body: Buffer.from(blob, "utf8"),
+    contentType: "application/octet-stream",
+  });
+  await core.db.exec({
+    text: `UPDATE cp_credentials
+           SET current_version = $1, updated_at = NOW()
+           WHERE id = $2 AND project_id = $3 AND status = 'active'`,
+    params: [newVersion, input.credentialId, input.projectId],
+  });
+  if (existing.currentVersion >= 1) {
+    await core.storage.delete(storageKey(input.credentialId, existing.currentVersion)).catch(() => {});
+  }
+  core.logger.info("credentials: secret replaced (rotated)", {
+    credential_id: input.credentialId,
+    new_version: newVersion,
+    project_id: input.projectId,
+    organization_id: input.organizationId,
+    user_id: input.actingPrincipal.userId,
+  });
+  return requireMetadata(core, input.projectId, input.credentialId);
+}
 
-  /**
-   * Revoke a credential: status → revoked and the current secret blob is
-   * DELETED (the metadata row remains for audit). A revoked credential
-   * never resolves again.
-   */
-  async revokeCredential(input: RevokeCredentialInput): Promise<CredentialMetadata> {
-    const existing = await this.getMetadata(input.projectId, input.credentialId);
-    if (!existing) {
-      throw notFound("credential.not_found", "the credential was not found in this project");
-    }
-    await this.db.exec({
-      text: `UPDATE cp_credentials SET status = 'revoked', updated_at = NOW()
-             WHERE id = $1 AND project_id = $2`,
-      params: [input.credentialId, input.projectId],
-    });
-    if (existing.currentVersion >= 1) {
-      await this.storage.delete(this.storageKey(input.credentialId, existing.currentVersion)).catch(() => {});
-    }
-    this.logger.info("credentials: revoked", {
+/**
+ * Revoke a credential: status → revoked and the current secret blob is
+ * DELETED (the metadata row remains for audit). A revoked credential
+ * never resolves again.
+ */
+async function revokeCredential(
+  core: CredentialsCore,
+  input: RevokeCredentialInput,
+): Promise<CredentialMetadata> {
+  const existing = await getMetadata(core, input.projectId, input.credentialId);
+  if (!existing) {
+    throw notFound("credential.not_found", "the credential was not found in this project");
+  }
+  await core.db.exec({
+    text: `UPDATE cp_credentials SET status = 'revoked', updated_at = NOW()
+           WHERE id = $1 AND project_id = $2`,
+    params: [input.credentialId, input.projectId],
+  });
+  if (existing.currentVersion >= 1) {
+    await core.storage.delete(storageKey(input.credentialId, existing.currentVersion)).catch(() => {});
+  }
+  core.logger.info("credentials: revoked", {
+    credential_id: input.credentialId,
+    project_id: input.projectId,
+    organization_id: input.organizationId,
+    user_id: input.actingPrincipal.userId,
+  });
+  return requireMetadata(core, input.projectId, input.credentialId);
+}
+
+// ---- Metadata reads (SAFE — never secret material) --------------------------
+
+async function getMetadata(
+  core: CredentialsCore,
+  projectId: string,
+  credentialId: string,
+): Promise<CredentialMetadata | null> {
+  const rows = await core.db.query({
+    text: `SELECT * FROM cp_credentials WHERE id = $1 AND project_id = $2`,
+    params: [credentialId, projectId],
+  });
+  const row = rows[0];
+  return row ? mapCredential(row as CredentialRow) : null;
+}
+
+async function listCredentials(
+  core: CredentialsCore,
+  projectId: string,
+  opts: ListCredentialsOptions,
+): Promise<CredentialPage> {
+  const limit = Math.max(1, Math.min(100, opts.limit ?? 25));
+  const where: string[] = [`project_id = $1`];
+  const params: unknown[] = [projectId];
+  if (!opts.includeRevoked) {
+    where.push(`status = 'active'`);
+  }
+  if (opts.cursor) {
+    params.push(opts.cursor);
+    where.push(`id < $${params.length}`);
+  }
+  const rows = await core.db.query({
+    text: `SELECT * FROM cp_credentials WHERE ${where.join(" AND ")}
+           ORDER BY id DESC LIMIT ${limit + 1}`,
+    params,
+  });
+  const all = rows.map((r) => mapCredential(r as CredentialRow));
+  const page = all.slice(0, limit);
+  const nextCursor = all.length > limit ? page[page.length - 1]!.id : null;
+  return { credentials: page, nextCursor };
+}
+
+// ---- The secret resolution boundary (§8, §10, §31) ----------------------------
+
+/**
+ * Resolve secret material for the execution/provider-adapter boundary
+ * ONLY — reachable exclusively through the frozen adapterResolver
+ * capability object (there is no other entry point). A revoked
+ * credential or a missing/corrupted blob fails closed.
+ */
+async function resolveForAdapter(
+  core: CredentialsCore,
+  input: ResolveCredentialInput,
+): Promise<ResolvedSecret> {
+  const metadata = await getMetadata(core, input.projectId, input.credentialId);
+  if (!metadata) {
+    throw notFound("credential.not_found", "the credential was not found in this project");
+  }
+  if (metadata.status !== "active") {
+    throw policyBlocked("credential.revoked", "the credential is revoked and cannot be resolved", {
+      reason: "credential_revoked",
       credential_id: input.credentialId,
-      project_id: input.projectId,
-      organization_id: input.organizationId,
-      user_id: input.actingPrincipal.userId,
     });
-    return this.requireMetadata(input.projectId, input.credentialId);
   }
-
-  // ---- Metadata reads (SAFE — never secret material) --------------------------
-
-  async getMetadata(projectId: string, credentialId: string): Promise<CredentialMetadata | null> {
-    const rows = await this.db.query({
-      text: `SELECT * FROM cp_credentials WHERE id = $1 AND project_id = $2`,
-      params: [credentialId, projectId],
-    });
-    const row = rows[0];
-    return row ? mapCredential(row as CredentialRow) : null;
-  }
-
-  async listCredentials(
-    projectId: string,
-    opts: ListCredentialsOptions = {},
-  ): Promise<CredentialPage> {
-    const limit = Math.max(1, Math.min(100, opts.limit ?? 25));
-    const where: string[] = [`project_id = $1`];
-    const params: unknown[] = [projectId];
-    if (!opts.includeRevoked) {
-      where.push(`status = 'active'`);
-    }
-    if (opts.cursor) {
-      params.push(opts.cursor);
-      where.push(`id < $${params.length}`);
-    }
-    const rows = await this.db.query({
-      text: `SELECT * FROM cp_credentials WHERE ${where.join(" AND ")}
-             ORDER BY id DESC LIMIT ${limit + 1}`,
-      params,
-    });
-    const all = rows.map((r) => mapCredential(r as CredentialRow));
-    const page = all.slice(0, limit);
-    const nextCursor = all.length > limit ? page[page.length - 1]!.id : null;
-    return { credentials: page, nextCursor };
-  }
-
-  // ---- The secret resolution boundary (§8, §10, §31) ----------------------------
-
-  /**
-   * Resolve secret material for the execution/provider-adapter boundary
-   * ONLY. Requires the branded AdapterCredentialGrant; a revoked
-   * credential or a missing/corrupted blob fails closed. Never called by
-   * HTTP handlers — there is no resolve endpoint.
-   */
-  async resolveForAdapter(input: ResolveCredentialInput): Promise<ResolvedSecret> {
-    const metadata = await this.getMetadata(input.projectId, input.credentialId);
-    if (!metadata) {
-      throw notFound("credential.not_found", "the credential was not found in this project");
-    }
-    if (metadata.status !== "active") {
-      throw policyBlocked("credential.revoked", "the credential is revoked and cannot be resolved", {
-        reason: "credential_revoked",
-        credential_id: input.credentialId,
-      });
-    }
-    if (metadata.currentVersion < 1) {
-      throw policyBlocked("credential.secret.missing", "the credential has no stored secret version", {
-        reason: "no_secret_version",
-        credential_id: input.credentialId,
-      });
-    }
-    let blobBytes: Uint8Array;
-    try {
-      blobBytes = await this.storage.get(this.storageKey(input.credentialId, metadata.currentVersion));
-    } catch {
-      throw new AppError({
-        category: "PLATFORM_FAILURE",
-        code: "credential.secret.storage_unavailable",
-        message: "the credential secret could not be read from secure storage",
-        retryable: true,
-      });
-    }
-    const value = decryptSecret(this.masterKey, input.credentialId, Buffer.from(blobBytes).toString("utf8"));
-    // Log SAFE metadata only — never the value, its length, or hashes.
-    this.logger.info("credentials: resolved for adapter boundary", {
+  if (metadata.currentVersion < 1) {
+    throw policyBlocked("credential.secret.missing", "the credential has no stored secret version", {
+      reason: "no_secret_version",
       credential_id: input.credentialId,
-      kind: metadata.kind,
-      version: metadata.currentVersion,
-      project_id: input.projectId,
-      organization_id: input.organizationId,
     });
-    return { credentialId: input.credentialId, kind: metadata.kind, value };
   }
-
-  // ---- internal helpers ----------------------------------------------------------
-
-  private storageKey(credentialId: string, version: number): string {
-    return `${STORAGE_PREFIX}/${credentialId}/v${version}`;
+  let blobBytes: Uint8Array;
+  try {
+    blobBytes = await core.storage.get(storageKey(input.credentialId, metadata.currentVersion));
+  } catch {
+    throw new AppError({
+      category: "PLATFORM_FAILURE",
+      code: "credential.secret.storage_unavailable",
+      message: "the credential secret could not be read from secure storage",
+      retryable: true,
+    });
   }
+  const value = decryptSecret(core.masterKey, input.credentialId, Buffer.from(blobBytes).toString("utf8"));
+  // Log SAFE metadata only — never the value, its length, or hashes.
+  core.logger.info("credentials: resolved for adapter boundary", {
+    credential_id: input.credentialId,
+    kind: metadata.kind,
+    version: metadata.currentVersion,
+    project_id: input.projectId,
+    organization_id: input.organizationId,
+  });
+  return { credentialId: input.credentialId, kind: metadata.kind, value };
+}
 
-  private async requireMetadata(projectId: string, credentialId: string): Promise<CredentialMetadata> {
-    const meta = await this.getMetadata(projectId, credentialId);
-    if (!meta) {
-      throw new AppError({
-        category: "PLATFORM_FAILURE",
-        code: "credential.readback.failed",
-        message: "credential operation succeeded but the metadata row could not be read back",
-        retryable: false,
-      });
-    }
-    return meta;
+// ---- internal helpers ----------------------------------------------------------
+
+function storageKey(credentialId: string, version: number): string {
+  return `${STORAGE_PREFIX}/${credentialId}/v${version}`;
+}
+
+async function requireMetadata(
+  core: CredentialsCore,
+  projectId: string,
+  credentialId: string,
+): Promise<CredentialMetadata> {
+  const meta = await getMetadata(core, projectId, credentialId);
+  if (!meta) {
+    throw new AppError({
+      category: "PLATFORM_FAILURE",
+      code: "credential.readback.failed",
+      message: "credential operation succeeded but the metadata row could not be read back",
+      retryable: false,
+    });
   }
+  return meta;
 }
 
 // ---- Row mapper + validation helpers --------------------------------------------

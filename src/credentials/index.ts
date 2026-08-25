@@ -4,21 +4,36 @@
 // declaration vocabulary + WORK-010 secret boundary): secret access
 // boundary and provider credential metadata.
 //
-// WORK-010 delivers the tenant-scoped secret boundary:
-//   - CredentialMetadata (cp_credentials, project-scoped) — the SAFE
-//     shape ordinary APIs may see (kind/name/status/version — never
-//     values)
-//   - SecretMaterial — encrypted (AES-256-GCM, HKDF-derived per-record
-//     key, deployment master key) in the PLATFORM ObjectStorage
-//     boundary; never in PostgreSQL, never in connection rows, never in
-//     logs, errors, API responses, or idempotency records
-//   - CredentialsService: create / replace (rotate) / revoke / metadata
-//     reads / resolveForAdapter (the ONLY secret-returning operation,
-//     gated on the branded AdapterCredentialGrant reserved for the
-//     future execution/provider-adapter seam — architecture §30)
-//   - Rotation keeps the credential identity stable (new version, old
-//     blob deleted — old versions cannot be resurrected); revoked
-//     credentials never resolve
+// WORK-010 delivers the tenant-scoped secret boundary with a RUNTIME
+// OBJECT-CAPABILITY design (architect review of PR #9):
+//
+//   createCredentialsBoundary(opts)        ← the SINGLE construction entry
+//        ↓
+//   { service, mutationAuthority, adapterResolver }
+//
+//   - service (CredentialsService): METADATA-ONLY reads. No mutation,
+//     no resolution, and NO grant-minting method exists anywhere —
+//     holding the service grants nothing beyond safe metadata.
+//   - mutationAuthority (CredentialMutationAuthority): create/rotate/
+//     revoke — injected into the /connections layer, which performs the
+//     tenant authorization before every call. A future consumer holding
+//     only the metadata service CANNOT mutate (the connection
+//     authorization boundary cannot be bypassed).
+//   - adapterResolver (AdapterCredentialResolver): the ONLY object in
+//     the system that can resolve secret material. RESERVED for the
+//     future execution/provider-adapter seam (WORK-014), which RECEIVES
+//     it by injection from the composition root. There is no minting,
+//     deriving, or other way to obtain resolution authority: the
+//     capability IS the object reference, enforced by runtime object
+//     ownership (frozen objects; references propagate only via explicit
+//     injection) — NOT by a TypeScript brand.
+//
+//   Secret material is encrypted (AES-256-GCM, HKDF-derived per-record
+//   key, deployment master key) in the PLATFORM ObjectStorage; never in
+//   PostgreSQL, never in connection rows, never in logs, errors, API
+//   responses, or idempotency records. Rotation keeps the credential
+//   identity stable (new version, old blob deleted); revoked credentials
+//   never resolve.
 //
 // TENANCY (lock §10): credentials are project-scoped. Callers resolve
 // the authorized (organization, project) pair through the /projects
@@ -28,8 +43,8 @@
 // DEPENDENCY DIRECTION (WORK-010 §26, §30): /credentials imports ONLY
 // @cp/platform (+ node builtins) — enforced by the static architecture
 // check. /providers imports the declaration vocabulary from here
-// (established in WORK-006); /connections consumes the service through
-// this public interface.
+// (established in WORK-006); /connections consumes the service + the
+// mutation capability through this public interface.
 //
 // This module is part of the frozen module set (architecture §35). It
 // exposes ONE public interface entry point; other modules may import
@@ -53,22 +68,27 @@ export type {
 } from "./internal/access.ts";
 export { StaticCredentialResolver } from "./internal/access.ts";
 
-// ---- CredentialsService (WORK-010 secret boundary) ------------------------
-export { CredentialsService } from "./internal/service.ts";
+// ---- The credentials boundary (WORK-010; architect review of PR #9) ------
+export {
+  CredentialsService,
+  createCredentialsBoundary,
+  CREDENTIAL_STATUSES,
+} from "./internal/service.ts";
 export type {
   CredentialStatus,
   CredentialMetadata,
   ResolvedSecret,
-  AdapterCredentialGrant,
+  CredentialsBoundary,
+  CredentialsBoundaryOptions,
+  CredentialMutationAuthority,
+  AdapterCredentialResolver,
   CreateCredentialInput,
   ReplaceSecretInput,
   RevokeCredentialInput,
   ResolveCredentialInput,
   ListCredentialsOptions,
   CredentialPage,
-  CredentialsServiceOptions,
 } from "./internal/service.ts";
-export { CREDENTIAL_STATUSES } from "./internal/service.ts";
 
 // ---- Schema migration --------------------------------------------------------
 export { CREDENTIALS_SCHEMA_STATEMENTS } from "./internal/schema.ts";

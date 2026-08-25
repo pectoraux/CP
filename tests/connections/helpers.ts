@@ -30,7 +30,13 @@ import {
 } from "@cp/providers";
 import { migrateCatalogSchema } from "@cp/catalog";
 import { migratePoliciesSchema } from "@cp/policies";
-import { CredentialsService, migrateCredentialsSchema } from "@cp/credentials";
+import {
+  createCredentialsBoundary,
+  migrateCredentialsSchema,
+  type CredentialsService,
+  type CredentialMutationAuthority,
+  type AdapterCredentialResolver,
+} from "@cp/credentials";
 import {
   ConnectionsService,
   migrateConnectionsSchema,
@@ -71,6 +77,8 @@ export interface ConnectionsTestContext {
   capabilities: CapabilitiesService;
   providers: ProvidersService;
   credentials: CredentialsService;
+  credentialMutations: CredentialMutationAuthority;
+  adapterResolver: AdapterCredentialResolver;
   connections: ConnectionsService;
   platformAdminP: Principal;
   cleanup: () => Promise<void>;
@@ -119,17 +127,26 @@ export async function setupConnections(
     capabilities,
     adapters: createDefaultAdapterRegistry(),
   });
-  const credentials = new CredentialsService({
+  // WORK-010 (architect review of PR #9): the boundary factory is the
+  // SINGLE capability distribution point — the metadata service +
+  // mutation capability go to the connection layer; the adapter resolver
+  // is exposed on the test context ONLY to verify the seam CAN receive
+  // and use it (never to the HTTP surface).
+  const credentialsBoundary = createCredentialsBoundary({
     db,
     storage,
     masterKeyHex: TEST_MASTER_KEY_HEX,
   });
+  const credentials = credentialsBoundary.service;
+  const credentialMutations = credentialsBoundary.mutationAuthority;
+  const adapterResolver = credentialsBoundary.adapterResolver;
   const connections = new ConnectionsService({
     db,
     projects,
     capabilities,
     providers,
     credentials,
+    credentialMutations,
   });
 
   // A platform admin (deployment bootstrap) for seeding global catalog data.
@@ -145,7 +162,8 @@ export async function setupConnections(
   };
   return {
     db, storage, auth, orgs, projects, capabilities, providers,
-    credentials, connections, platformAdminP, cleanup,
+    credentials, credentialMutations, adapterResolver, connections,
+    platformAdminP, cleanup,
   };
 }
 

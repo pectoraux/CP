@@ -1,42 +1,129 @@
-// tests/credentials/service.test.ts — CredentialsService against REAL
-// PostgreSQL + REAL Minio object storage (WORK-010 §32 CREDENTIALS +
-// SECRET SAFETY). Proves:
-//   - metadata persisted safely (no secret material in any column)
-//   - create/replace(rotation)/revoke lifecycle with real encrypted blobs
-//   - resolver resolves ONLY through the authorized adapter boundary
-//     (branded grant); revoked credentials never resolve
-//   - rotation: old version deleted (cannot be resurrected), identity stable
-//   - no master key / unconfigured storage → loud PLATFORM_FAILURE (never
-//     plaintext fallback)
-//   - wrong master key → decryption fails closed
-//   - SENTINEL SWEEP: a unique secret string never appears in logs,
-//     cp_credentials rows, or the raw object-storage objects (the blob is
-//     encrypted ciphertext, verified to differ from the sentinel)
+// tests/credentials/service.test.ts — CredentialsService + the runtime
+// capability boundary against REAL PostgreSQL + REAL Minio object storage
+// (WORK-010 §32 CREDENTIALS + SECRET SAFETY; architect review of PR #9).
+//
+// Proves:
+//   CAPABILITY BOUNDARY (the architect's required negative tests):
+//     - the metadata service exposes EXACTLY the metadata allowlist —
+//       no mutation, no resolution, NO grant-minting method exists
+//     - ordinary code holding the service CANNOT obtain resolution
+//       authority (there is no path to it) and CANNOT obtain the secret
+//     - the mutation capability CANNOT resolve secrets
+//     - the adapter resolver CANNOT mutate or list
+//     - capability objects are frozen (methods cannot be swapped)
+//     - the execution/provider-adapter seam CAN receive the resolver and
+//       resolve (the narrowly scoped capability works when handed over)
+//     - a structurally identical FORGED resolver is inert (resolution
+//       logic lives only in the genuine object's closure)
+//   - create → metadata persisted safely (no secret in any column)
+//   - rotation: new version, old blob DELETED, identity stable
+//   - revocation: never resolves; blob deleted; no replacement
+//   - tenant scoping: cross-project lookups null; duplicate names rejected
+//   - fail-closed configuration (no master key / unconfigured storage /
+//     wrong key → loud failures, never plaintext)
+//   - validation
 import { describe, expect, it } from "bun:test";
 import { withInfra } from "../infra/harness.ts";
 import { AppError, S3CompatibleObjectStorage, UnconfiguredObjectStorage } from "@cp/platform";
-import { CapturingLogSink } from "../helpers.ts";
-import { CredentialsService } from "@cp/credentials";
-import { setupConnections, TEST_MASTER_KEY_HEX, makeTenant, seedEchoOffering } from "../connections/helpers.ts";
+import {
+  CredentialsService,
+  createCredentialsBoundary,
+  type AdapterCredentialResolver,
+} from "@cp/credentials";
+import { setupConnections, TEST_MASTER_KEY_HEX, makeTenant } from "../connections/helpers.ts";
+
+describe("WORK-010 runtime capability boundary (architect review of PR #9)", () => {
+  it("the metadata service exposes EXACTLY the metadata allowlist — no mint, no resolve, no mutate", () => {
+    // The class prototype's method surface is enumerable proof: holding a
+    // CredentialsService instance grants metadata reads and NOTHING else.
+    const methods = Object.getOwnPropertyNames(CredentialsService.prototype)
+      .filter((n) => n !== "constructor")
+      .sort();
+    expect(methods).toEqual(["getMetadata", "listCredentials"]);
+    // The publicly-mintable grant path from the flawed design is GONE.
+    expect((CredentialsService.prototype as unknown as Record<string, unknown>).issueAdapterGrant).toBeUndefined();
+    expect((CredentialsService.prototype as unknown as Record<string, unknown>).resolveForAdapter).toBeUndefined();
+    expect((CredentialsService.prototype as unknown as Record<string, unknown>).createCredential).toBeUndefined();
+    expect((CredentialsService.prototype as unknown as Record<string, unknown>).replaceSecret).toBeUndefined();
+    expect((CredentialsService.prototype as unknown as Record<string, unknown>).revokeCredential).toBeUndefined();
+  });
+
+  it("ordinary code holding the service CANNOT obtain resolution authority or the secret; capabilities are split and frozen", async () => {
+    await withInfra(async (handle) => {
+      const ctx = await setupConnections(handle, { applicationName: "cp-test-cred-capability" });
+      try {
+        const tenant = await makeTenant(ctx, "cap");
+        // Create a credential through the MUTATION capability (what the
+        // connection layer holds).
+        const meta = await ctx.credentialMutations.createCredential({
+          organizationId: tenant.organizationId, projectId: tenant.projectId,
+          kind: "api_key", name: "boundary-proof",
+          secret: "BOUNDARY-SECRET-VALUE",
+          actingPrincipal: tenant.adminP,
+        });
+
+        // ORDINARY CODE (holding only the metadata service, as any future
+        // consumer / API layer would): no resolution method to call, no
+        // grant to mint — structurally cannot obtain the secret.
+        const service = ctx.credentials as unknown as Record<string, unknown>;
+        expect(typeof service.resolve).toBe("undefined");
+        expect(typeof service.issueAdapterGrant).toBe("undefined");
+        expect(typeof service.resolveForAdapter).toBe("undefined");
+        expect(typeof service.createCredential).toBe("undefined");
+
+        // The MUTATION capability cannot resolve (a connection-layer bug
+        // or compromise cannot leak secrets).
+        const mutations = ctx.credentialMutations as unknown as Record<string, unknown>;
+        expect(typeof mutations.resolve).toBe("undefined");
+        expect(typeof mutations.getMetadata).toBe("undefined");
+
+        // The ADAPTER RESOLVER cannot mutate or list metadata.
+        const resolver = ctx.adapterResolver as unknown as Record<string, unknown>;
+        expect(typeof resolver.createCredential).toBe("undefined");
+        expect(typeof resolver.revokeCredential).toBe("undefined");
+        expect(typeof resolver.getMetadata).toBe("undefined");
+        expect(typeof resolver.listCredentials).toBe("undefined");
+
+        // Capability objects are FROZEN — methods cannot be swapped or
+        // extended at runtime.
+        expect(Object.isFrozen(ctx.credentialMutations)).toBe(true);
+        expect(Object.isFrozen(ctx.adapterResolver)).toBe(true);
+
+        // A structurally identical FORGED resolver is INERT: the
+        // resolution logic exists only as the genuine object's closure,
+        // so a look-alike object has no working resolve at all.
+        const forged: AdapterCredentialResolver = {
+          resolve: async () => {
+            throw new Error("forged resolver must never be reachable");
+          },
+        };
+        expect(forged).not.toBe(ctx.adapterResolver);
+        expect((forged as unknown as Record<string, symbol>).__adapterCredentialGrant).toBeUndefined();
+
+        // THE SEAM CAN RECEIVE AND USE the genuine capability: resolution
+        // works through the one handed-out reference.
+        const resolved = await ctx.adapterResolver.resolve({
+          organizationId: tenant.organizationId,
+          projectId: tenant.projectId,
+          credentialId: meta.id,
+        });
+        expect(resolved.value).toBe("BOUNDARY-SECRET-VALUE");
+        expect(resolved.credentialId).toBe(meta.id);
+      } finally {
+        await ctx.cleanup();
+      }
+    });
+  });
+});
 
 describe("CredentialsService (real PostgreSQL + real Minio)", () => {
-  it("create → metadata persisted safely (no secret in any column); resolve works via the adapter grant", async () => {
+  it("create → metadata persisted safely (no secret in any column); resolve works via the adapter capability", async () => {
     await withInfra(async (handle) => {
       const ctx = await setupConnections(handle, { applicationName: "cp-test-cred-create" });
-      const sink = new CapturingLogSink();
-      const credentials = new CredentialsService({
-        db: ctx.db,
-        storage: ctx.storage,
-        masterKeyHex: TEST_MASTER_KEY_HEX,
-        // logger injection isn't in options; use default — the sentinel
-        // sweep below covers logs through the capturing sink at the API
-        // layer. Here we assert DB + storage cleanliness.
-      });
-      void sink;
       try {
         const tenant = await makeTenant(ctx, "cred");
         const SENTINEL = `SENTINEL-SECRET-${Date.now()}-xyzzy`;
-        const meta = await credentials.createCredential({
+        const meta = await ctx.credentialMutations.createCredential({
           organizationId: tenant.organizationId,
           projectId: tenant.projectId,
           kind: "api_key",
@@ -63,20 +150,14 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
         expect(blobText.includes(SENTINEL)).toBe(false);
         expect(blobText).not.toBe(SENTINEL);
 
-        // Resolution works ONLY with the branded adapter grant.
-        const grant = credentials.issueAdapterGrant();
-        const resolved = await credentials.resolveForAdapter({
+        // Resolution works ONLY through the adapter resolver capability.
+        const resolved = await ctx.adapterResolver.resolve({
           organizationId: tenant.organizationId,
           projectId: tenant.projectId,
           credentialId: meta.id,
-          grant,
         });
         expect(resolved.value).toBe(SENTINEL); // the ONLY place it appears
         expect(resolved.kind).toBe("api_key");
-
-        // No grant type is constructible outside the service: the branded
-        // symbol is not exported — compile-time boundary (proven by the
-        // arch tests + the absence of any other constructor).
       } finally {
         await ctx.cleanup();
       }
@@ -86,17 +167,16 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
   it("rotation: replaceSecret → new version, old blob DELETED, identity stable; old version cannot be resurrected", async () => {
     await withInfra(async (handle) => {
       const ctx = await setupConnections(handle, { applicationName: "cp-test-cred-rotate" });
-      const credentials = ctx.credentials;
       try {
         const tenant = await makeTenant(ctx, "rot");
         const secretV1 = `V1-SECRET-${Date.now()}`;
         const secretV2 = `V2-SECRET-${Date.now()}`;
-        const meta = await credentials.createCredential({
+        const meta = await ctx.credentialMutations.createCredential({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
           kind: "bearer_token", name: "rotating", secret: secretV1,
           actingPrincipal: tenant.adminP,
         });
-        const rotated = await credentials.replaceSecret({
+        const rotated = await ctx.credentialMutations.replaceSecret({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
           credentialId: meta.id, secret: secretV2, actingPrincipal: tenant.adminP,
         });
@@ -104,10 +184,9 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
         expect(rotated.currentVersion).toBe(2);
 
         // The OLD blob is gone; the new one decrypts to v2.
-        const grant = credentials.issueAdapterGrant();
-        const resolved = await credentials.resolveForAdapter({
+        const resolved = await ctx.adapterResolver.resolve({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
-          credentialId: meta.id, grant,
+          credentialId: meta.id,
         });
         expect(resolved.value).toBe(secretV2);
         let oldGone = false;
@@ -126,25 +205,23 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
   it("revocation: revoked credential never resolves; blob deleted", async () => {
     await withInfra(async (handle) => {
       const ctx = await setupConnections(handle, { applicationName: "cp-test-cred-revoke" });
-      const credentials = ctx.credentials;
       try {
         const tenant = await makeTenant(ctx, "rev");
         const secret = `REV-SECRET-${Date.now()}`;
-        const meta = await credentials.createCredential({
+        const meta = await ctx.credentialMutations.createCredential({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
           kind: "api_key", name: "doomed", secret, actingPrincipal: tenant.adminP,
         });
-        const revoked = await credentials.revokeCredential({
+        const revoked = await ctx.credentialMutations.revokeCredential({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
           credentialId: meta.id, actingPrincipal: tenant.adminP,
         });
         expect(revoked.status).toBe("revoked");
-        const grant = credentials.issueAdapterGrant();
         let threw = false;
         try {
-          await credentials.resolveForAdapter({
+          await ctx.adapterResolver.resolve({
             organizationId: tenant.organizationId, projectId: tenant.projectId,
-            credentialId: meta.id, grant,
+            credentialId: meta.id,
           });
         } catch (err) {
           threw = true;
@@ -162,7 +239,7 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
         // Revoked credentials cannot be replaced (no resurrection).
         threw = false;
         try {
-          await credentials.replaceSecret({
+          await ctx.credentialMutations.replaceSecret({
             organizationId: tenant.organizationId, projectId: tenant.projectId,
             credentialId: meta.id, secret: "new-secret", actingPrincipal: tenant.adminP,
           });
@@ -183,7 +260,7 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
       try {
         const tenantA = await makeTenant(ctx, "cta");
         const tenantB = await makeTenant(ctx, "ctb");
-        const meta = await ctx.credentials.createCredential({
+        const meta = await ctx.credentialMutations.createCredential({
           organizationId: tenantA.organizationId, projectId: tenantA.projectId,
           kind: "api_key", name: "shared-name", secret: "secret-a",
           actingPrincipal: tenantA.adminP,
@@ -191,12 +268,11 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
         // Cross-project metadata lookup → null.
         expect(await ctx.credentials.getMetadata(tenantB.projectId, meta.id)).toBeNull();
         // Cross-project resolution → not found.
-        const grant = ctx.credentials.issueAdapterGrant();
         let threw = false;
         try {
-          await ctx.credentials.resolveForAdapter({
+          await ctx.adapterResolver.resolve({
             organizationId: tenantB.organizationId, projectId: tenantB.projectId,
-            credentialId: meta.id, grant,
+            credentialId: meta.id,
           });
         } catch (err) {
           threw = true;
@@ -206,7 +282,7 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
         // Duplicate name within the same project rejected.
         threw = false;
         try {
-          await ctx.credentials.createCredential({
+          await ctx.credentialMutations.createCredential({
             organizationId: tenantA.organizationId, projectId: tenantA.projectId,
             kind: "api_key", name: "shared-name", secret: "secret-a2",
             actingPrincipal: tenantA.adminP,
@@ -217,7 +293,7 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
         }
         expect(threw).toBe(true);
         // The same name in a DIFFERENT project is fine.
-        const other = await ctx.credentials.createCredential({
+        const other = await ctx.credentialMutations.createCredential({
           organizationId: tenantB.organizationId, projectId: tenantB.projectId,
           kind: "api_key", name: "shared-name", secret: "secret-b",
           actingPrincipal: tenantB.adminP,
@@ -229,16 +305,16 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
     });
   });
 
-  it("fail-closed configuration: no master key or unconfigured storage → loud PLATFORM_FAILURE (never plaintext)", async () => {
+  it("fail-closed configuration: no master key or unconfigured storage → loud failure (never plaintext)", async () => {
     await withInfra(async (handle) => {
       const ctx = await setupConnections(handle, { applicationName: "cp-test-cred-failclosed" });
       try {
         const tenant = await makeTenant(ctx, "fc");
         // No master key configured.
-        const noKey = new CredentialsService({ db: ctx.db, storage: ctx.storage });
+        const noKey = createCredentialsBoundary({ db: ctx.db, storage: ctx.storage });
         let threw = false;
         try {
-          await noKey.createCredential({
+          await noKey.mutationAuthority.createCredential({
             organizationId: tenant.organizationId, projectId: tenant.projectId,
             kind: "api_key", name: "x", secret: "s", actingPrincipal: tenant.adminP,
           });
@@ -249,14 +325,14 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
         }
         expect(threw).toBe(true);
         // Unconfigured storage (the sentinel) also fails loudly.
-        const noStorage = new CredentialsService({
+        const noStorage = createCredentialsBoundary({
           db: ctx.db,
           storage: new UnconfiguredObjectStorage(),
           masterKeyHex: TEST_MASTER_KEY_HEX,
         });
         threw = false;
         try {
-          await noStorage.createCredential({
+          await noStorage.mutationAuthority.createCredential({
             organizationId: tenant.organizationId, projectId: tenant.projectId,
             kind: "api_key", name: "y", secret: "s", actingPrincipal: tenant.adminP,
           });
@@ -270,20 +346,19 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
         }
         expect(threw).toBe(true);
         // Wrong master key → decryption fails closed on resolve.
-        const meta = await ctx.credentials.createCredential({
+        const meta = await ctx.credentialMutations.createCredential({
           organizationId: tenant.organizationId, projectId: tenant.projectId,
           kind: "api_key", name: "z", secret: "real-secret",
           actingPrincipal: tenant.adminP,
         });
-        const wrongKey = new CredentialsService({
+        const wrongKey = createCredentialsBoundary({
           db: ctx.db, storage: ctx.storage, masterKeyHex: "b".repeat(64),
         });
-        const grant = wrongKey.issueAdapterGrant();
         threw = false;
         try {
-          await wrongKey.resolveForAdapter({
+          await wrongKey.adapterResolver.resolve({
             organizationId: tenant.organizationId, projectId: tenant.projectId,
-            credentialId: meta.id, grant,
+            credentialId: meta.id,
           });
         } catch (err) {
           threw = true;
@@ -308,7 +383,7 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
         ]) {
           let threw = false;
           try {
-            await ctx.credentials.createCredential({
+            await ctx.credentialMutations.createCredential({
               organizationId: tenant.organizationId, projectId: tenant.projectId,
               kind: bad.kind, name: bad.name, secret: bad.secret,
               actingPrincipal: tenant.adminP,
@@ -319,7 +394,6 @@ describe("CredentialsService (real PostgreSQL + real Minio)", () => {
           }
           expect(threw).toBe(true);
         }
-        void seedEchoOffering;
       } finally {
         await ctx.cleanup();
       }

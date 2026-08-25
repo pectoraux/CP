@@ -232,6 +232,43 @@ describe("connections/credentials boundaries (real source tree)", () => {
     }
   });
 
+  it("NO MINT PATH: the real /credentials CODE contains no grant-minting method (comments documenting the fix are stripped)", async () => {
+    const files = await listFiles(f("credentials"));
+    for (const file of files) {
+      const content = await readFile(file, "utf8");
+      // Strip comments: the fix is DOCUMENTED in comments (the flawed
+      // design is described so it is not reintroduced) — the assertion
+      // targets executable code.
+      const codeOnly = content
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/^\s*\/\/.*$/gm, "");
+      expect(codeOnly.includes("issueAdapterGrant"), `${file} must not contain a grant-minting method in code`).toBe(false);
+      expect(codeOnly.includes("AdapterCredentialGrant"), `${file} must not contain the flawed grant type in code`).toBe(false);
+    }
+  });
+
+  it("NO RESOLVER REACHABLE FROM HANDLERS: api route handlers never reference the resolver or the boundary factory (composition root only)", async () => {
+    // The composition root (server.ts) is the ONLY place the boundary is
+    // constructed and the ONLY holder of the adapter resolver reference.
+    const handlerFiles = (await listFiles(f("api"))).filter(
+      (p) => p.includes("handlers") || p.includes("middleware") || p.includes("idempotency"),
+    );
+    expect(handlerFiles.length).toBeGreaterThan(0);
+    for (const file of handlerFiles) {
+      const content = await readFile(file, "utf8");
+      expect(content.includes("createCredentialsBoundary"), `${file} must not construct the credentials boundary`).toBe(false);
+      expect(content.includes("adapterResolver"), `${file} must not reference the adapter resolver capability`).toBe(false);
+      expect(content.includes("adapterCredentialResolver"), `${file} must not reference the adapter resolver capability`).toBe(false);
+      expect(content.includes("mutationAuthority"), `${file} must not reference the mutation capability`).toBe(false);
+    }
+    // And server.ts — the composition root — does NOT leak the resolver
+    // onto the returned Api object (grep the return statement's fields).
+    const server = await readFile(f("api/internal/server.ts"), "utf8");
+    expect(server.includes("adapterResolver:")).toBe(false);
+    expect(server.includes("adapterCredentialResolver:")).toBe(false);
+    expect(server.includes("credentialsBoundary:")).toBe(false);
+  });
+
   it("the whole tree passes arch:check with the new rules (invoked programmatically)", async () => {
     const files = await listFiles(SRC);
     const inputs = await Promise.all(
