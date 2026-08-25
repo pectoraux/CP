@@ -169,6 +169,63 @@ describe("connections/credentials boundaries (synthetic detection)", () => {
     }
   });
 
+  it("rejects EVERY module except the composition root importing the credentials composition entry (alias form)", () => {
+    const factoryImport = `import { createCredentialsBoundary } from "@cp/credentials/composition";`;
+    for (const path of [
+      "api/internal/handlers-connections.ts",
+      "api/internal/middleware.ts",
+      "api/internal/handlers-eligibility.ts",
+      "main.ts",
+      "connections/internal/service.ts",
+      "providers/internal/service.ts",
+      "catalog/internal/service.ts",
+      "policies/internal/service.ts",
+      "eligibility/internal/service.ts",
+    ]) {
+      const v = analyzeImports([{ path: f(path), content: factoryImport }]);
+      expect(v.length, `${path} importing the composition entry must be rejected`).toBe(1);
+      expect(v[0]!.rule).toBe("credentials-composition-restricted");
+      expect(v[0]!.message).toContain("composition root");
+    }
+    // The .ts-suffixed alias form is rejected identically.
+    const v2 = analyzeImports([
+      {
+        path: f("connections/internal/service.ts"),
+        content: `import { createCredentialsBoundary } from "@cp/credentials/composition.ts";`,
+      },
+    ]);
+    expect(v2.length).toBe(1);
+    expect(v2[0]!.rule).toBe("credentials-composition-restricted");
+    // /platform is doubly forbidden: its import fires the STRONGER
+    // platform-no-domain-imports rule (priority chain) — defense in depth.
+    const v3 = analyzeImports([
+      { path: f("platform/internal/runtime.ts"), content: factoryImport },
+    ]);
+    expect(v3.length).toBe(1);
+    expect(v3[0]!.rule).toBe("platform-no-domain-imports");
+  });
+
+  it("rejects the RELATIVE form into the composition entry from any non-root module", () => {
+    const v = analyzeImports([
+      {
+        path: f("connections/internal/service.ts"),
+        content: `import { createCredentialsBoundary } from "../../credentials/composition.ts";`,
+      },
+    ]);
+    expect(v.length).toBe(1);
+    expect(v[0]!.rule).toBe("credentials-composition-restricted");
+  });
+
+  it("ALLOWS the composition root (src/api/internal/server.ts) — exactly one trusted place", () => {
+    const v = analyzeImports([
+      {
+        path: f("api/internal/server.ts"),
+        content: `import { createCredentialsBoundary } from "@cp/credentials/composition";`,
+      },
+    ]);
+    expect(v).toEqual([]);
+  });
+
   it("moduleOf classifies the new module paths correctly", () => {
     expect(moduleOf(f("connections/index.ts"))).toBe("connections");
     expect(moduleOf(f("connections/internal/service.ts"))).toBe("connections");
@@ -267,6 +324,42 @@ describe("connections/credentials boundaries (real source tree)", () => {
     expect(server.includes("adapterResolver:")).toBe(false);
     expect(server.includes("adapterCredentialResolver:")).toBe(false);
     expect(server.includes("credentialsBoundary:")).toBe(false);
+  });
+
+  it("PUBLIC INTERFACE HAS NO FACTORY: index.ts does not export the capability constructor (comments stripped)", async () => {
+    const idx = await readFile(f("credentials/index.ts"), "utf8");
+    const codeOnly = idx
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    expect(codeOnly.includes("createCredentialsBoundary")).toBe(false);
+    // And the module namespace-level check lives in
+    // tests/credentials/service.test.ts (runtime proof).
+  });
+
+  it("ONLY THE COMPOSITION ROOT references the composition entry in the real tree (import specifiers, not comments)", async () => {
+    const files = await listFiles(SRC);
+    const importRe = /(?:from\s*|import\s*\()\s*['"]([^'"]+)['"]/g;
+    for (const file of files) {
+      const content = await readFile(file, "utf8");
+      const specifiers = [...content.matchAll(importRe)].map((m) => m[1]!);
+      for (const s of specifiers) {
+        const hits =
+          s === "@cp/credentials/composition" ||
+          s === "@cp/credentials/composition.ts" ||
+          /(^|\/\.)\.?\.?\/credentials\/composition(\.ts)?$/.test(s);
+        if (!hits) continue;
+        const rel = file.slice(SRC.length + 1).replace(/\\/g, "/");
+        expect(
+          rel,
+          `only the composition root may import the credentials composition entry (found in ${rel})`,
+        ).toBe("api/internal/server.ts");
+      }
+    }
+  });
+
+  it("the composition root ACTUALLY imports the composition entry (the trusted wiring exists)", async () => {
+    const server = await readFile(f("api/internal/server.ts"), "utf8");
+    expect(server.includes("@cp/credentials/composition")).toBe(true);
   });
 
   it("the whole tree passes arch:check with the new rules (invoked programmatically)", async () => {

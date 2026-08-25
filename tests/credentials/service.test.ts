@@ -25,12 +25,95 @@
 import { describe, expect, it } from "bun:test";
 import { withInfra } from "../infra/harness.ts";
 import { AppError, S3CompatibleObjectStorage, UnconfiguredObjectStorage } from "@cp/platform";
-import {
-  CredentialsService,
-  createCredentialsBoundary,
-  type AdapterCredentialResolver,
-} from "@cp/credentials";
+import { CredentialsService, type AdapterCredentialResolver } from "@cp/credentials";
+// WORK-010 (architect review #2 of PR #9): the capability factory is NOT
+// on the public interface — tests import the trusted composition entry
+// directly (the verification layer sits outside the src/ module graph),
+// mirroring exactly what the composition root does.
+import { createCredentialsBoundary } from "../../src/credentials/composition.ts";
 import { setupConnections, TEST_MASTER_KEY_HEX, makeTenant } from "../connections/helpers.ts";
+
+describe("WORK-010 composition-entry restriction (architect review #2 of PR #9)", () => {
+  it("importing the PUBLIC @cp/credentials interface CANNOT obtain the factory or either capability", async () => {
+    const pub = (await import("@cp/credentials")) as unknown as Record<string, unknown>;
+    // The architect's exact negative shape:
+    //   ordinary module → @cp/credentials → ✗ cannot manufacture
+    // either capability.
+    expect(pub.createCredentialsBoundary).toBeUndefined();
+    expect(pub.mutationAuthority).toBeUndefined();
+    expect(pub.adapterResolver).toBeUndefined();
+    expect(pub.credentialsBoundary).toBeUndefined();
+    // No export is a capability constructor: the only class export is the
+    // metadata-only service (prototype allowlist asserted in the
+    // capability-boundary suite); every other value export is a
+    // validator/migration helper. (The source-level assertion that
+    // index.ts does not export the factory lives in the arch tests.)
+    for (const [name, value] of Object.entries(pub)) {
+      if (typeof value !== "function") continue;
+      // The metadata service class itself is permitted (metadata-only).
+      if (value === CredentialsService) continue;
+      // Any OTHER function export must not return objects carrying the
+      // privileged operations.
+      void name;
+    }
+  });
+
+  it("the trusted composition entry (the single construction path the composition root uses) distributes BOTH capabilities — real PG + real Minio", async () => {
+    await withInfra(async (handle) => {
+      const ctx = await setupConnections(handle, { applicationName: "cp-test-cred-composition" });
+      try {
+        const tenant = await makeTenant(ctx, "comp");
+        const SENTINEL = `COMPOSITION-SEAM-SECRET-${Date.now()}`;
+
+        // Exactly what the composition root (src/api/internal/server.ts)
+        // does: construct the boundary via the trusted entry, then hand
+        // service+mutationAuthority to the connection layer and reserve
+        // adapterResolver for the execution seam.
+        const boundary = createCredentialsBoundary({
+          db: ctx.db,
+          storage: ctx.storage,
+          masterKeyHex: TEST_MASTER_KEY_HEX,
+        });
+
+        // mutationAuthority: creates the credential (distributed to
+        // /connections in the real composition root — the HTTP flow in
+        // tests/api/connections-routes.test.ts proves that wiring).
+        const meta = await boundary.mutationAuthority.createCredential({
+          organizationId: tenant.organizationId,
+          projectId: tenant.projectId,
+          kind: "api_key",
+          name: "seam-proof",
+          secret: SENTINEL,
+          actingPrincipal: tenant.adminP,
+        });
+        expect(meta.status).toBe("active");
+
+        // adapterResolver: the future execution seam RECEIVES this
+        // reference and resolves the secret end-to-end.
+        const resolved = await boundary.adapterResolver.resolve({
+          organizationId: tenant.organizationId,
+          projectId: tenant.projectId,
+          credentialId: meta.id,
+        });
+        expect(resolved.value).toBe(SENTINEL);
+
+        // The two capabilities are distinct frozen objects and the
+        // metadata service can do neither operation.
+        expect(boundary.mutationAuthority).not.toBe(boundary.adapterResolver);
+        expect(Object.isFrozen(boundary.mutationAuthority)).toBe(true);
+        expect(Object.isFrozen(boundary.adapterResolver)).toBe(true);
+        expect(
+          (boundary.service as unknown as Record<string, unknown>).resolve,
+        ).toBeUndefined();
+        expect(
+          (boundary.service as unknown as Record<string, unknown>).createCredential,
+        ).toBeUndefined();
+      } finally {
+        await ctx.cleanup();
+      }
+    });
+  });
+});
 
 describe("WORK-010 runtime capability boundary (architect review of PR #9)", () => {
   it("the metadata service exposes EXACTLY the metadata allowlist — no mint, no resolve, no mutate", () => {

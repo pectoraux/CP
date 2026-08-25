@@ -35,7 +35,15 @@ import {
 import { CatalogService, migrateCatalogSchema } from "@cp/catalog";
 import { PoliciesService, migratePoliciesSchema } from "@cp/policies";
 import { EligibilityService } from "@cp/eligibility";
-import { createCredentialsBoundary, migrateCredentialsSchema } from "@cp/credentials";
+import { migrateCredentialsSchema } from "@cp/credentials";
+// WORK-010 (architect review #2 of PR #9): the capability factory is
+// imported from the TRUSTED composition entry — this file (the
+// composition root) is the ONLY place in the codebase permitted to
+// construct the privileged credential capabilities
+// (arch-check rule credentials-composition-restricted). The ordinary
+// public interface (@cp/credentials) does not export the factory, so no
+// ordinary module can manufacture credential authority.
+import { createCredentialsBoundary } from "@cp/credentials/composition";
 import { ConnectionsService, migrateConnectionsSchema } from "@cp/connections";
 import {
   correlationMiddleware,
@@ -165,15 +173,18 @@ export function createApi(
     policies,
     projects,
   });
-  // WORK-010 + architect review of PR #9: the credentials boundary is
-  // the RUNTIME CAPABILITY DISTRIBUTION POINT. The metadata service and
-  // the mutation capability are injected into the connection layer; the
-  // adapter RESOLUTION capability is reserved for the future execution/
-  // provider-adapter seam (WORK-014), which will RECEIVE it by injection
-  // below. There is NO minting method anywhere: authority = holding the
-  // object reference, and references propagate only via this wiring.
-  // The master key comes from deployment configuration
-  // (CP_CREDENTIAL_MASTER_KEY) — never persisted, never logged.
+  // WORK-010 + architect reviews #1 + #2 of PR #9: the credentials
+  // boundary is the RUNTIME CAPABILITY DISTRIBUTION POINT, constructed
+  // HERE — the single trusted composition root (the factory is not on
+  // the module's public interface and is importable only by this file).
+  // The metadata service and the mutation capability are injected into
+  // the connection layer; the adapter RESOLUTION capability is reserved
+  // for the future execution/provider-adapter seam (WORK-014), which
+  // will RECEIVE it by injection below. There is NO minting method
+  // anywhere: authority = holding the object reference, and references
+  // propagate only via this wiring. The master key comes from deployment
+  // configuration (CP_CREDENTIAL_MASTER_KEY) — never persisted, never
+  // logged.
   const credentialsBoundary = createCredentialsBoundary({
     db: runtime.db,
     storage: runtime.storage,

@@ -119,6 +119,36 @@ const PROVIDER_SDK_PACKAGES = [
 // Both rules apply to the BARE alias form only — deep/internal/relative
 // forms are already rejected by the generic cross-module rules, which
 // take priority (at most one violation per specifier).
+// WORK-010 (architect reviews #1 + #2 of PR #9): the credentials
+// capability composition entry (src/credentials/composition.ts) is the
+// ONLY constructor of the privileged credential capabilities
+// (mutationAuthority / adapterResolver). It is NOT part of the module's
+// public interface; it may be imported by EXACTLY ONE trusted file —
+// the composition root — so no ordinary module can manufacture
+// credential authority. This is the designated composition-root
+// mechanism for the runtime object-capability secret boundary.
+const CREDENTIALS_COMPOSITION_SUBPATHS = new Set([
+  "composition",
+  "composition.ts",
+]);
+const CREDENTIALS_COMPOSITION_ROOTS = new Set([
+  "api/internal/server.ts",
+]);
+
+/** Is this file the trusted credentials composition root? */
+function isCredentialsCompositionRoot(file) {
+  const rel = relative(SRC, file).split(sep).join("/");
+  return CREDENTIALS_COMPOSITION_ROOTS.has(rel);
+}
+
+/** Does this subpath under /credentials target the composition entry? */
+function isCredentialsCompositionSubpath(subpath) {
+  return (
+    CREDENTIALS_COMPOSITION_SUBPATHS.has(subpath) ||
+    subpath.startsWith("composition/")
+  );
+}
+
 const DIRECTIONAL_FORBIDDEN = new Map([
   // WORK-008 §22/§25: /policies is tenant-scoped customer configuration
   // (hard constraints + preferences). It may import @cp/platform,
@@ -417,6 +447,22 @@ function classifyViolation(c, importingModule, file, specifier) {
         message: `/platform must not import module "${targetModule}" (${specifier})`,
       };
     }
+    // (1.5) WORK-010 capability composition entry: importable ONLY by the
+    // composition root. This rule takes priority over the generic
+    // deep-import rule so the trusted file's import is legal while every
+    // other importer (handlers, main, any domain module) is rejected.
+    if (targetModule === "credentials" && isCredentialsCompositionSubpath(subpath)) {
+      if (!isCredentialsCompositionRoot(file)) {
+        return {
+          file,
+          specifier,
+          rule: "credentials-composition-restricted",
+          message:
+            `the credentials capability composition entry (${specifier}) may be imported ONLY by the composition root (${[...CREDENTIALS_COMPOSITION_ROOTS].join(", ")}) — ordinary modules cannot manufacture credential authority`,
+        };
+      }
+      return null; // the trusted composition root may import it.
+    }
     // (2) /api must not import module internals.
     if (importingModule === "api" && isInternal) {
       return {
@@ -486,6 +532,20 @@ function classifyViolation(c, importingModule, file, specifier) {
         rule: "platform-no-domain-imports",
         message: `/platform must not import module "${targetModule}" (${specifier})`,
       };
+    }
+    // (1.5) credentials capability composition entry (relative form):
+    // importable ONLY by the composition root.
+    if (targetModule === "credentials" && isCredentialsCompositionSubpath(sub)) {
+      if (!isCredentialsCompositionRoot(file)) {
+        return {
+          file,
+          specifier,
+          rule: "credentials-composition-restricted",
+          message:
+            `the credentials capability composition entry (reached via ${specifier}) may be imported ONLY by the composition root (${[...CREDENTIALS_COMPOSITION_ROOTS].join(", ")}) — ordinary modules cannot manufacture credential authority`,
+        };
+      }
+      return null;
     }
     // (2) /api must not import module internals.
     if (importingModule === "api" && isInternal) {

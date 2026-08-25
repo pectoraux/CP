@@ -31,12 +31,17 @@ import {
 import { migrateCatalogSchema } from "@cp/catalog";
 import { migratePoliciesSchema } from "@cp/policies";
 import {
-  createCredentialsBoundary,
   migrateCredentialsSchema,
   type CredentialsService,
   type CredentialMutationAuthority,
   type AdapterCredentialResolver,
 } from "@cp/credentials";
+// WORK-010 (architect review #2 of PR #9): the capability factory is NOT
+// on the public interface — tests import the trusted composition entry
+// directly (the verification layer sits outside the src/ module graph the
+// architecture checker governs), mirroring exactly what the composition
+// root does.
+import { createCredentialsBoundary } from "../../src/credentials/composition.ts";
 import {
   ConnectionsService,
   migrateConnectionsSchema,
