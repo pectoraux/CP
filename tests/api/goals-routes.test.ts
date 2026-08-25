@@ -150,6 +150,29 @@ describe("WORK-011 goals + outcome contracts routes (real PG, in-app)", () => {
         expect(version.objectives[1]!.kind).toBe("preference");
         expect(version.outcome_contract.contract_id).toBe(cv.contract_id);
 
+        // 3b. VERSION INTEGRITY over HTTP: a goal version referencing a
+        // DRAFT (still-mutable) contract version is rejected with a
+        // structured error — a mutable measurement definition can never
+        // back an activatable goal version.
+        const draftC = await app.request(`${base}/outcome-contracts`, {
+          method: "POST", headers: auth,
+          body: JSON.stringify({ name: "draft-contract", content: SUCCESS_CONTRACT }),
+        });
+        expect(draftC.status).toBe(201);
+        const draftCv = ((await draftC.json()) as { contract_version: { contract_id: string } }).contract_version;
+        const draftRef = await app.request(`${base}/goals/${goal.id}/versions`, {
+          method: "POST", headers: auth,
+          body: JSON.stringify({
+            objectives: [{ direction: "maximize", metric: "success_rate", kind: "hard" }],
+            outcome_contract_id: draftCv.contract_id,
+            outcome_contract_version: "1",
+          }),
+        });
+        expect(draftRef.status).toBe(403);
+        const draftRefBody = (await draftRef.json()) as { error: { code: string; details?: { stage?: string } } };
+        expect(draftRefBody.error.code).toBe("goal.outcome_contract.mutable");
+        expect(draftRefBody.error.details?.stage).toBe("creation");
+
         // 4. Activate the goal version; verify the active resolution.
         const gact = await app.request(`${base}/goals/${goal.id}/versions/1/lifecycle`, {
           method: "POST", headers: auth, body: JSON.stringify({ status: "active" }),

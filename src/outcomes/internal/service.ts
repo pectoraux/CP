@@ -12,11 +12,13 @@
 //
 // Versioning/lifecycle (the WORK-005/008 precedents): draft → active →
 // deprecated → retired; drafts replaceable; published versions
-// IMMUTABLE (historical goal versions remain interpretable against the
-// exact contract version they reference); at-most-one-active via a
-// partial unique index; activation auto-deprecates the previous active
-// version within one transaction; concurrent activation is race-safe
-// (one winner, deterministic conflict).
+// IMMUTABLE — this immutability is what ACTIVE goal versions depend on
+// for their measurement semantics (a goal version references the exact
+// contract version, never a copy; the reference can therefore never
+// mean something different later); at-most-one-active via a partial
+// unique index; activation auto-deprecates the previous active version
+// within one transaction; concurrent activation is race-safe (one
+// winner, deterministic conflict).
 //
 // TENANCY (§3, §19): project-scoped; the (organizationId, projectId)
 // pair is resolved by the /api org/project gates and re-verified here
@@ -334,7 +336,11 @@ export class OutcomesService {
   /**
    * Replace the content of a DRAFT version (never published). Published
    * versions are IMMUTABLE — historical goal versions stay interpretable
-   * against the exact contract version they reference.
+   * against the exact contract version they reference, and an ACTIVE
+   * goal's measurement semantics can never change underneath it. A
+   * contract version referenced by a goal version must therefore be
+   * published (see GoalsService's creation/activation gates) before it
+   * can carry that role; from then on this method refuses it.
    */
   async updateDraftContent(input: UpdateDraftContentInput): Promise<OutcomeContractVersion> {
     await this.requireProjectScope(input.organizationId, input.projectId, input.actingPrincipal, {
