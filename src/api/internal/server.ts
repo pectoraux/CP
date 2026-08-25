@@ -45,6 +45,8 @@ import { migrateCredentialsSchema } from "@cp/credentials";
 // ordinary module can manufacture credential authority.
 import { createCredentialsBoundary } from "@cp/credentials/composition";
 import { ConnectionsService, migrateConnectionsSchema } from "@cp/connections";
+import { OutcomesService, migrateOutcomesSchema } from "@cp/outcomes";
+import { GoalsService, migrateGoalsSchema } from "@cp/goals";
 import {
   correlationMiddleware,
   errorMiddleware,
@@ -60,6 +62,7 @@ import { createCatalogRoutes } from "./handlers-catalog.ts";
 import { createPolicyRoutes } from "./handlers-policies.ts";
 import { createEligibilityRoutes } from "./handlers-eligibility.ts";
 import { createConnectionRoutes } from "./handlers-connections.ts";
+import { createGoalRoutes } from "./handlers-goals.ts";
 import {
   IdempotencyStore,
   migrateIdempotencySchema,
@@ -77,6 +80,8 @@ export interface Api {
   policies: PoliciesService;
   eligibility: EligibilityService;
   connections: ConnectionsService;
+  outcomes: OutcomesService;
+  goals: GoalsService;
   idempotency: IdempotencyStore;
   /**
    * Create or update the /auth + /organizations + /projects + capabilities
@@ -212,6 +217,21 @@ export function createApi(
     credentials,
     credentialMutations,
   });
+  // WORK-011: the outcome-contract layer owns the versioned, immutable
+  // measurement definitions; the goal layer owns the customer objectives
+  // and references exact contract versions through the public interface.
+  // Both are project-scoped customer configuration (architecture §5).
+  const outcomes = new OutcomesService({
+    db: runtime.db,
+    logger: runtime.logger,
+    projects,
+  });
+  const goals = new GoalsService({
+    db: runtime.db,
+    logger: runtime.logger,
+    projects,
+    outcomes,
+  });
   const idempotency = new IdempotencyStore({
     db: runtime.db,
     logger: runtime.logger,
@@ -272,6 +292,11 @@ export function createApi(
   // endpoint is the ONLY secret-bearing route and uses redacted-fingerprint
   // idempotency so raw secrets never reach cp_idempotency.
   createConnectionRoutes({ runtime, auth, orgs, projects, connections, idempotency }, app);
+  // WORK-011 goal + outcome-contract routes under the project scope.
+  // The standard WORK-004 tenant gates run first; the services
+  // re-verify membership + admin/owner role for mutations. Reads are
+  // member-open. No secrets are involved anywhere in this domain.
+  createGoalRoutes({ runtime, auth, orgs, projects, goals, outcomes, idempotency }, app);
 
   // Start the in-process worker so enqueued jobs actually run.
   runtime.queue.start();
@@ -286,10 +311,12 @@ export function createApi(
     await migratePoliciesSchema(runtime.db as Database);
     await migrateCredentialsSchema(runtime.db as Database);
     await migrateConnectionsSchema(runtime.db as Database);
+    await migrateOutcomesSchema(runtime.db as Database);
+    await migrateGoalsSchema(runtime.db as Database);
     await migrateIdempotencySchema(runtime.db as Database);
   };
 
-  return { app, runtime, auth, orgs, projects, capabilities, providers, catalog, policies, eligibility, connections, idempotency, migrate };
+  return { app, runtime, auth, orgs, projects, capabilities, providers, catalog, policies, eligibility, connections, outcomes, goals, idempotency, migrate };
 }
 
 export interface ServeOptions extends RuntimeOptions {
